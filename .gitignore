@@ -1,0 +1,94 @@
+# Python
+
+**pycache**/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDEs / editors
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment / secrets
+
+.env
+.env.*
+!.env.example
+
+# Logs
+
+*.log
+
+# Jupyter
+
+.ipynb_checkpoints/
+
+# Project data
+
+# Raw MTA GTFS data is downloaded separately and should not be committed.
+
+/data/raw/*
+
+# Keep the raw-data directory itself in the repository if needed.
+
+/data/raw/.gitkeep
+
+# Generated / processed datasets
+
+/data/processed/*
+
+# Keep the processed-data directory itself in the repository if needed.
+
+/data/processed/.gitkeep
+
+# Generated visualizations
+
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+
+# Generated reports / exports
+
+*.csv
+*.json
+*.parquet
+*.feather
+
+# Build / distribution artifacts
+
+build/
+dist/
+*.egg-info/
+
+# Local temporary files
+
+tmp/
+temp/
+*.tmp
+*.bak
