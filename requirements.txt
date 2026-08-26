@@ -9,6 +9,8 @@ python-dotenv==1.0.1
 duckdb==1.1.0
 pandas==2.2.2
 pyarrow==17.0.0
+numpy==1.26.4
+networkx==3.3
 
 # Optional distributed processing (heavier - install if you want the
 # Spark-based reconciliation path instead of / alongside DuckDB)

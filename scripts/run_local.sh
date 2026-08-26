@@ -27,7 +27,7 @@ fi
 echo "== Step 2: quick ingestion smoke test (5 min, polling every 45s) =="
 timeout 300 python -m ingestion.poll_feeds --loop || true
 
-TODAY=$(date -u +%Y-%m-%d)
+TODAY=$(TZ=America/New_York date +%Y-%m-%d)
 
 echo "== Step 3: parse snapshots for $TODAY =="
 python -m processing.parse_snapshots --date "$TODAY"

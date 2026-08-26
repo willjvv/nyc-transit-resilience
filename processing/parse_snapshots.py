@@ -1,21 +1,20 @@
+"""Normalize raw GTFS-realtime snapshots without destroying prediction history.
+
+Outputs per service date:
+  - trip_update_observations.parquet: every observed prediction
+  - trip_updates.parquet: latest observation per (realtime trip, stop), retained
+    as a convenient terminal-prediction table for daily metrics
+  - vehicle_positions.parquet: latest observed vehicle position per trip
+
+The realtime timestamp remains an absolute Unix timestamp. Derived local/service-day
+fields are added only for analytical joins so that UTC and GTFS service-day semantics
+are never conflated.
 """
-Reads a day's worth of raw snapshots and normalizes them into two clean
-tables:
+from __future__ import annotations
 
-  - trip_updates: one row per (trip_id, stop_id) predicted arrival/departure,
-    deduped across overlapping polls (we poll every 30-60s, so the same
-    trip/stop prediction shows up in many consecutive snapshots).
-  - vehicle_positions: one row per (trip_id) latest known position.
-
-Output: data/processed/date=YYYY-MM-DD/trip_updates.parquet
-        data/processed/date=YYYY-MM-DD/vehicle_positions.parquet
-
-Usage:
-    python -m processing.parse_snapshots --date 2026-08-25
-    python -m processing.parse_snapshots            # defaults to yesterday (UTC)
-"""
 import argparse
 import ast
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -24,6 +23,8 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
+from processing.time_utils import NY_TZ, local_date_from_unix, service_date_candidates
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("parse_snapshots")
 
@@ -31,126 +32,185 @@ RAW_DATA_DIR = Path(os.getenv("RAW_DATA_DIR", "data/raw"))
 PROCESSED_DATA_DIR = Path(os.getenv("PROCESSED_DATA_DIR", "data/processed"))
 
 
-def _safe_literal_eval(value):
-    """Raw snapshots store nested protobuf fields as Python-repr strings
-    (see storage/writer.py). Parse them back into dicts, tolerating
-    None/empty gracefully - a single malformed row shouldn't kill the
-    whole batch job."""
+def _safe_mapping(value):
     if value is None or value == "" or value == "None":
         return None
+    if isinstance(value, dict):
+        return value
     try:
-        return ast.literal_eval(value)
-    except (ValueError, SyntaxError):
-        return None
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return None
 
 
-def load_raw_snapshots(date: str) -> pd.DataFrame:
-    """Load every raw snapshot file for a given date across all lines/hours."""
-    date_dir = RAW_DATA_DIR / f"date={date}"
-    if not date_dir.exists():
-        log.warning("No raw data found for date=%s at %s", date, date_dir)
+def _raw_dates_for_service_date(service_date: str) -> list[str]:
+    """Load UTC partitions spanning the requested New York service date."""
+    d = datetime.strptime(service_date, "%Y-%m-%d").date()
+    # A service day can extend past local midnight, so include the next UTC day.
+    return [d.isoformat(), (d + timedelta(days=1)).isoformat()]
+
+
+def load_raw_snapshots(service_date: str) -> pd.DataFrame:
+    paths = []
+    for utc_date in _raw_dates_for_service_date(service_date):
+        date_dir = RAW_DATA_DIR / f"date={utc_date}"
+        if date_dir.exists():
+            paths.append(date_dir)
+
+    if not paths:
+        log.warning("No raw data found spanning service date=%s at %s", service_date, RAW_DATA_DIR)
         return pd.DataFrame()
 
     con = duckdb.connect()
-    # DuckDB glob reads every partition in one shot and gives us the
-    # partition columns (line, hour) back for free.
+    globs = ", ".join([f"'{p}/**/*.parquet'" for p in paths])
     query = f"""
         SELECT *
-        FROM read_parquet('{date_dir}/**/*.parquet', hive_partitioning=1)
+        FROM read_parquet([{globs}], hive_partitioning=1)
     """
     df = con.execute(query).df()
-    log.info("Loaded %s raw entity rows for date=%s", len(df), date)
+    if df.empty:
+        return df
+
+    # Keep observations from the requested local service date plus the next-day
+    # after-midnight extension. Candidate service-date filtering happens below.
     return df
 
 
-def extract_trip_updates(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten trip_update.stop_time_update[] into one row per
-    (trip_id, stop_id, predicted_time), keeping only the MOST RECENT
-    prediction seen across all snapshots (later polls have fresher
-    predictions for the same trip/stop)."""
-    rows = []
+def _prediction_rows(raw_df: pd.DataFrame) -> list[dict]:
+    rows: list[dict] = []
     for _, raw_row in raw_df.iterrows():
-        tu = _safe_literal_eval(raw_row.get("trip_update"))
+        tu = _safe_mapping(raw_row.get("trip_update"))
         if not tu:
             continue
-
-        trip = tu.get("trip", {})
+        trip = tu.get("trip") or {}
         trip_id = trip.get("trip_id")
         route_id = trip.get("route_id")
-        direction = trip.get("nyct_trip_descriptor", {}).get("direction") if isinstance(
-            trip.get("nyct_trip_descriptor"), dict
-        ) else None
+        start_date = trip.get("start_date")
+        schedule_relationship = trip.get("schedule_relationship")
+        descriptor = trip.get("nyct_trip_descriptor") or {}
+        direction = descriptor.get("direction") if isinstance(descriptor, dict) else None
+        direction_id = trip.get("direction_id")
+        observed_at = pd.to_numeric(raw_row.get("feed_timestamp"), errors="coerce")
+        if pd.isna(observed_at):
+            observed_at = pd.to_numeric(raw_row.get("fetched_at"), errors="coerce")
 
-        for stu in tu.get("stop_time_update", []):
-            arrival = stu.get("arrival", {}).get("time")
-            departure = stu.get("departure", {}).get("time")
+        for stu in tu.get("stop_time_update", []) or []:
+            arrival = (stu.get("arrival") or {}).get("time")
+            departure = (stu.get("departure") or {}).get("time")
+            predicted = arrival if arrival is not None else departure
+            if predicted is None or trip_id is None or stu.get("stop_id") is None:
+                continue
+
+            predicted_num = pd.to_numeric(predicted, errors="coerce")
+            if pd.isna(predicted_num):
+                continue
+
             rows.append(
                 {
                     "trip_id": trip_id,
                     "route_id": route_id,
                     "direction": direction,
+                    "direction_id": direction_id,
                     "stop_id": stu.get("stop_id"),
-                    "predicted_arrival": arrival,
-                    "predicted_departure": departure,
-                    "line": raw_row.get("line"),
-                    "observed_at": raw_row.get("feed_timestamp"),
+                    "stop_sequence": stu.get("stop_sequence"),
+                    "schedule_relationship": schedule_relationship,
+                    "trip_start_date": start_date,
+                    "predicted_arrival": int(predicted_num),
+                    "predicted_arrival_utc": datetime.fromtimestamp(
+                        int(predicted_num), tz=timezone.utc
+                    ).isoformat(),
+                    "observed_at": int(observed_at) if pd.notna(observed_at) else None,
+                    "observed_at_utc": (
+                        datetime.fromtimestamp(int(observed_at), tz=timezone.utc).isoformat()
+                        if pd.notna(observed_at)
+                        else None
+                    ),
+                    "feed_name": raw_row.get("feed_name") or raw_row.get("line"),
                 }
             )
+    return rows
 
+
+def extract_trip_updates(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Return every prediction observation plus derived service-day context."""
+    rows = _prediction_rows(raw_df)
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-    df = df.dropna(subset=["trip_id", "stop_id"])
+    for col in ("predicted_arrival", "observed_at", "stop_sequence", "direction_id"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Dedup: keep the prediction with the LATEST observed_at for each
-    # (trip_id, stop_id) pair - that's the freshest prediction we have.
-    df["observed_at"] = pd.to_numeric(df["observed_at"], errors="coerce")
-    df = df.sort_values("observed_at").drop_duplicates(
-        subset=["trip_id", "stop_id"], keep="last"
+    df["local_date"] = df["predicted_arrival"].map(local_date_from_unix)
+    candidates = df["predicted_arrival"].map(service_date_candidates)
+    df["service_date_candidates"] = candidates
+    df["prediction_history_key"] = (
+        df["trip_id"].astype(str) + "|" + df["stop_id"].astype(str)
     )
+
+    # Keep rows belonging to the requested service date in main() rather than
+    # collapsing to a single UTC date here.
     return df.reset_index(drop=True)
+
+
+def latest_trip_updates(observations: pd.DataFrame, service_date: str) -> pd.DataFrame:
+    """Select the terminal observed prediction per trip/stop for daily metrics."""
+    if observations.empty:
+        return observations.copy()
+    mask = observations["service_date_candidates"].map(
+        lambda pairs: service_date in {d for d, _ in pairs}
+    )
+    df = observations.loc[mask].copy()
+    if df.empty:
+        return df
+    # Use feed observation time, not predicted time, as the history ordering key.
+    df = df.sort_values(["prediction_history_key", "observed_at", "predicted_arrival"])
+    return df.drop_duplicates("prediction_history_key", keep="last").reset_index(drop=True)
 
 
 def extract_vehicle_positions(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten vehicle position entities into one row per trip_id, keeping
-    only the latest observed position."""
-    rows = []
+    rows: list[dict] = []
     for _, raw_row in raw_df.iterrows():
-        veh = _safe_literal_eval(raw_row.get("vehicle"))
+        veh = _safe_mapping(raw_row.get("vehicle"))
         if not veh:
             continue
-
-        trip = veh.get("trip", {})
+        trip = veh.get("trip") or {}
+        trip_id = trip.get("trip_id")
+        if trip_id is None:
+            continue
+        timestamp = pd.to_numeric(veh.get("timestamp"), errors="coerce")
         rows.append(
             {
-                "trip_id": trip.get("trip_id"),
+                "trip_id": trip_id,
                 "route_id": trip.get("route_id"),
                 "current_stop_id": veh.get("stop_id"),
                 "current_status": veh.get("current_status"),
-                "timestamp": veh.get("timestamp"),
-                "line": raw_row.get("line"),
+                "timestamp": int(timestamp) if pd.notna(timestamp) else None,
+                "timestamp_utc": (
+                    datetime.fromtimestamp(int(timestamp), tz=timezone.utc).isoformat()
+                    if pd.notna(timestamp)
+                    else None
+                ),
+                "feed_name": raw_row.get("feed_name") or raw_row.get("line"),
             }
         )
-
     if not rows:
         return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df = df.dropna(subset=["trip_id"])
+    df = pd.DataFrame(rows).dropna(subset=["trip_id"])
     df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
-    df = df.sort_values("timestamp").drop_duplicates(subset=["trip_id"], keep="last")
-    return df.reset_index(drop=True)
+    return (
+        df.sort_values("timestamp")
+        .drop_duplicates(subset=["trip_id"], keep="last")
+        .reset_index(drop=True)
+    )
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--date",
-        type=str,
-        default=(datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d"),
-        help="Date to process, YYYY-MM-DD (default: yesterday UTC)",
-    )
+    parser.add_argument("--date", type=str, default=(datetime.now(NY_TZ).date() - timedelta(days=1)).isoformat())
     args = parser.parse_args()
 
     raw_df = load_raw_snapshots(args.date)
@@ -158,18 +218,30 @@ def main():
         log.warning("Nothing to process for %s", args.date)
         return
 
-    trip_updates = extract_trip_updates(raw_df)
+    observations = extract_trip_updates(raw_df)
+    service_mask = observations["service_date_candidates"].map(
+        lambda pairs: args.date in {d for d, _ in pairs}
+    ) if not observations.empty else pd.Series(dtype=bool)
+    observations_for_date = observations.loc[service_mask].copy() if not observations.empty else observations
     vehicle_positions = extract_vehicle_positions(raw_df)
 
     out_dir = PROCESSED_DATA_DIR / f"date={args.date}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not trip_updates.empty:
-        trip_updates.to_parquet(out_dir / "trip_updates.parquet", index=False)
-        log.info("Wrote %s deduped trip_update rows", len(trip_updates))
+    if not observations_for_date.empty:
+        persisted_observations = observations_for_date.drop(columns=["service_date_candidates"])
+        persisted_observations.to_parquet(out_dir / "trip_update_observations.parquet", index=False)
+        latest = latest_trip_updates(observations_for_date, args.date)
+        latest.drop(columns=["service_date_candidates"]).to_parquet(
+            out_dir / "trip_updates.parquet", index=False
+        )
+        log.info(
+            "Wrote %s prediction observations and %s terminal predictions for service date %s",
+            len(observations_for_date), len(latest), args.date,
+        )
     if not vehicle_positions.empty:
         vehicle_positions.to_parquet(out_dir / "vehicle_positions.parquet", index=False)
-        log.info("Wrote %s deduped vehicle_position rows", len(vehicle_positions))
+        log.info("Wrote %s latest vehicle positions", len(vehicle_positions))
 
 
 if __name__ == "__main__":

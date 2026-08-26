@@ -33,7 +33,7 @@ STATIC_DIR = Path(os.getenv("STATIC_GTFS_DIR", "data/static_gtfs"))
 # The GTFS tables we actually need for reconciliation. GTFS bundles
 # contain more files than this (fare_rules, shapes, etc) - skip what
 # we don't use to keep this fast and the output small.
-TABLES_TO_LOAD = ["routes", "trips", "stop_times", "stops", "calendar"]
+TABLES_TO_LOAD = ["routes", "trips", "stop_times", "stops", "calendar", "calendar_dates"]
 
 
 def download_static_bundle(url: str) -> zipfile.ZipFile:
