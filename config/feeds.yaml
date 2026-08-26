@@ -1,0 +1,49 @@
+# MTA GTFS-realtime subway feeds.
+# Base reference: https://api.mta.info/#/subwayRealTimeFeeds
+#
+# IMPORTANT: MTA has changed these endpoint paths before. Before your
+# first real run, verify each URL against the current list at
+# https://api.mta.info/#/subwayRealTimeFeeds or https://www.mta.info/developers
+# and update this file if any have moved - poll_feeds.py logs a clear
+# error per feed if a URL 404s, so it's easy to spot.
+#
+# Each feed covers a group of lines. "lines" is used only for labeling
+# and filtering in downstream processing - the feed itself contains
+# updates for every line in the group.
+
+feeds:
+  - name: "1234567S"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs"
+    lines: ["1", "2", "3", "4", "5", "6", "7", "S"]
+
+  - name: "ACE"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace"
+    lines: ["A", "C", "E"]
+
+  - name: "BDFM"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm"
+    lines: ["B", "D", "F", "M"]
+
+  - name: "G"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-g"
+    lines: ["G"]
+
+  - name: "JZ"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-jz"
+    lines: ["J", "Z"]
+
+  - name: "NQRW"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-nqrw"
+    lines: ["N", "Q", "R", "W"]
+
+  - name: "L"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-l"
+    lines: ["L"]
+
+  - name: "SIR"
+    url: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-si"
+    lines: ["SIR"]
+
+# Static schedule bundle - downloaded once (and refreshed periodically)
+# by ingestion/gtfs_static_loader.py
+static_gtfs_url: "http://web.mta.info/developers/data/nyct/subway/google_transit.zip"

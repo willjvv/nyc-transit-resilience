@@ -1,0 +1,29 @@
+# Cron schedule for the NYC subway pipeline. Lightweight alternative to
+# Airflow - good enough for a solo project.
+#
+# Install with: crontab orchestration/crontab.txt
+# (edit the paths below to match your actual deployment location first)
+#
+# Assumes:
+#   - repo checked out at /home/ubuntu/nyc-subway-pipeline
+#   - venv at /home/ubuntu/nyc-subway-pipeline/.venv
+#   - .env file configured in the repo root
+
+PROJECT_DIR=/home/ubuntu/nyc-subway-pipeline
+PYTHON=/home/ubuntu/nyc-subway-pipeline/.venv/bin/python
+
+# Ingestion: poll every feed once a minute. poll_feeds.py itself has an
+# internal --loop mode too, but running it via cron each minute is more
+# resilient - a crashed loop process would otherwise stop ingesting
+# silently until someone notices.
+* * * * * cd $PROJECT_DIR && $PYTHON -m ingestion.poll_feeds >> logs/ingestion.log 2>&1
+
+# Processing: run once daily at 2:10am, comfortably after midnight so
+# the full previous day's raw data is available.
+10 2 * * * cd $PROJECT_DIR && $PYTHON -m processing.parse_snapshots >> logs/processing.log 2>&1
+15 2 * * * cd $PROJECT_DIR && $PYTHON -m processing.reconcile >> logs/processing.log 2>&1
+20 2 * * * cd $PROJECT_DIR && $PYTHON -m processing.metrics >> logs/processing.log 2>&1
+
+# Static schedule refresh: MTA updates this roughly monthly. Refresh
+# weekly on Sundays at 3am to stay current without hammering their server.
+0 3 * * 0 cd $PROJECT_DIR && $PYTHON -m ingestion.gtfs_static_loader >> logs/static_refresh.log 2>&1
