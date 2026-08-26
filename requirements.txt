@@ -1,4 +1,29 @@
-pandas
-pyarrow
-networkx
-matplotlib
+# Ingestion
+requests==2.32.3
+gtfs-realtime-bindings==1.0.0
+protobuf==5.27.2
+pyyaml==6.0.2
+python-dotenv==1.0.1
+
+# Storage / processing
+duckdb==1.1.0
+pandas==2.2.2
+pyarrow==17.0.0
+
+# Optional distributed processing (heavier - install if you want the
+# Spark-based reconciliation path instead of / alongside DuckDB)
+# pyspark==3.5.1
+
+# Orchestration (optional - only needed if using the Airflow DAG instead
+# of cron)
+# apache-airflow==2.9.3
+
+# Dashboard
+streamlit==1.38.0
+plotly==5.23.0
+
+# Testing
+pytest==8.3.2
+
+# Optional: only needed if you configure R2/B2 off-box storage in .env
+# boto3==1.35.0
