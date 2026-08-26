@@ -1,199 +1,296 @@
+"""Reconcile realtime predictions with the active static GTFS schedule.
+
+This module treats a realtime trip update as a *prediction*, not an observed
+arrival. Each prediction gets matched to an active scheduled stop-time using:
+
+  1. service date / calendar validity
+  2. route_id
+  3. stop_id
+  4. stop_sequence when supplied by GTFS-RT
+  5. direction when available
+  6. nearest service-day arrival time within a bounded window
+
+Ambiguous candidates are retained as ambiguous instead of silently assigning
+the prediction to the wrong train.
 """
-The core engineering problem of this project: realtime trip_ids and
-static schedule trip_ids do NOT reliably match, so we can't just JOIN
-on trip_id. Instead we match on (route_id, direction, stop_id, and a
-time window) - the same approach used by prior art in this space (see
-README).
+from __future__ import annotations
 
-Matching strategy:
-  1. For each realtime trip_update row (a predicted arrival at a stop),
-     find static schedule stop_times for the same route_id + stop_id
-     where the scheduled arrival falls within MATCH_WINDOW_MINUTES of
-     the predicted arrival.
-  2. If exactly one static trip matches, that's our match - compute
-     delay_seconds = predicted_arrival - scheduled_arrival.
-  3. If zero static trips match within the window, mark as unmatched
-     (a "ghost train" candidate - either an extra/unscheduled train, or
-     a matching bug worth investigating).
-  4. If multiple static trips match (happens during high-frequency
-     service), pick the closest in time - ties are rare in practice at
-     subway frequencies but this keeps the join deterministic.
-
-Output: data/processed/date=YYYY-MM-DD/reconciled_trips.parquet
-  Columns: trip_id, route_id, stop_id, direction, predicted_arrival,
-           scheduled_arrival, delay_seconds, match_status
-
-Usage:
-    python -m processing.reconcile --date 2026-08-25
-"""
 import argparse
 import logging
 import os
+from bisect import bisect_left
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import duckdb
+import pandas as pd
+
+from processing.time_utils import NY_TZ, parse_gtfs_time, service_date_candidates, service_date_from_gtfs_date
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("reconcile")
 
 PROCESSED_DATA_DIR = Path(os.getenv("PROCESSED_DATA_DIR", "data/processed"))
 STATIC_GTFS_DIR = Path(os.getenv("STATIC_GTFS_DIR", "data/static_gtfs"))
-
-# How far apart (in minutes) a predicted arrival can be from a scheduled
-# arrival and still be considered "the same trip". Subway headways are
-# often 3-8 minutes at peak, so this window needs to be tight enough to
-# avoid matching adjacent trains but loose enough to catch real delays.
 MATCH_WINDOW_MINUTES = 10
+AMBIGUITY_MARGIN_SECONDS = 60
+HIGH_CONFIDENCE_SECONDS = 60
+LOW_CONFIDENCE_SECONDS = 8 * 60
 
 
-def reconcile_date(date: str) -> None:
-    trip_updates_path = PROCESSED_DATA_DIR / f"date={date}" / "trip_updates.parquet"
-    if not trip_updates_path.exists():
-        log.warning("No trip_updates found for %s - run parse_snapshots first", date)
-        return
+def _load_active_service_ids(service_date: str) -> set[str]:
+    calendar_path = STATIC_GTFS_DIR / "calendar.parquet"
+    if not calendar_path.exists():
+        raise FileNotFoundError(f"Missing {calendar_path}")
 
-    stop_times_path = STATIC_GTFS_DIR / "stop_times.parquet"
+    target = datetime.strptime(service_date, "%Y-%m-%d")
+    weekday_column = target.strftime("%A").lower()
+    calendar = pd.read_parquet(calendar_path)
+    active: set[str] = set()
+
+    for _, row in calendar.iterrows():
+        start = str(row.get("start_date", ""))
+        end = str(row.get("end_date", ""))
+        if len(start) != 8 or len(end) != 8:
+            continue
+        try:
+            start_d = datetime.strptime(start, "%Y%m%d").date()
+            end_d = datetime.strptime(end, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if not (start_d <= target.date() <= end_d):
+            continue
+        if str(row.get(weekday_column, "0")) != "1":
+            continue
+        active.add(str(row["service_id"]))
+
+    # calendar_dates is an optional GTFS exception table; support additions/removals
+    # when the static loader has captured it.
+    exceptions_path = STATIC_GTFS_DIR / "calendar_dates.parquet"
+    if exceptions_path.exists():
+        exceptions = pd.read_parquet(exceptions_path)
+        day = target.strftime("%Y%m%d")
+        day_rows = exceptions[exceptions["date"].astype(str) == day]
+        for _, row in day_rows.iterrows():
+            sid = str(row["service_id"])
+            if int(row["exception_type"]) == 1:
+                active.add(sid)
+            elif int(row["exception_type"]) == 2:
+                active.discard(sid)
+    return active
+
+
+def _static_schedule(service_date: str) -> pd.DataFrame:
+    stops_path = STATIC_GTFS_DIR / "stop_times.parquet"
     trips_path = STATIC_GTFS_DIR / "trips.parquet"
-    if not stop_times_path.exists() or not trips_path.exists():
-        log.warning(
-            "Static GTFS tables not found - run ingestion.gtfs_static_loader first"
+    if not stops_path.exists() or not trips_path.exists():
+        raise FileNotFoundError("Static GTFS trips.parquet and stop_times.parquet are required")
+
+    active_services = _load_active_service_ids(service_date)
+    trips = pd.read_parquet(trips_path)
+    stop_times = pd.read_parquet(stops_path)
+
+    if "service_id" in trips.columns and active_services:
+        trips = trips[trips["service_id"].astype(str).isin(active_services)].copy()
+    elif "service_id" in trips.columns and not active_services:
+        trips = trips.iloc[0:0].copy()
+
+    keep_trip_cols = [c for c in ["trip_id", "route_id", "direction_id", "service_id"] if c in trips.columns]
+    schedule = stop_times.merge(trips[keep_trip_cols], on="trip_id", how="inner")
+    schedule["scheduled_arrival_seconds"] = schedule["arrival_time"].map(parse_gtfs_time)
+    schedule = schedule.dropna(subset=["scheduled_arrival_seconds", "route_id", "stop_id"])
+    schedule["scheduled_arrival_seconds"] = schedule["scheduled_arrival_seconds"].astype(int)
+    schedule["service_date"] = service_date
+    schedule["direction_id"] = pd.to_numeric(schedule.get("direction_id"), errors="coerce") if "direction_id" in schedule else pd.Series(index=schedule.index, dtype="float64")
+    schedule["stop_sequence"] = pd.to_numeric(schedule.get("stop_sequence"), errors="coerce") if "stop_sequence" in schedule else pd.Series(index=schedule.index, dtype="float64")
+    return schedule[
+        [
+            "trip_id", "route_id", "stop_id", "direction_id", "stop_sequence",
+            "service_id", "service_date", "scheduled_arrival_seconds"
+        ]
+    ].rename(columns={"trip_id": "static_trip_id"})
+
+
+def _prediction_service_seconds(row: pd.Series, service_date: str) -> int | None:
+    predicted = pd.to_numeric(row.get("predicted_arrival"), errors="coerce")
+    if pd.isna(predicted):
+        return None
+    start_date = service_date_from_gtfs_date(row.get("trip_start_date"))
+    candidates = service_date_candidates(int(predicted))
+    if start_date:
+        for candidate_date, seconds in candidates:
+            if candidate_date == start_date:
+                return seconds
+    for candidate_date, seconds in candidates:
+        if candidate_date == service_date:
+            return seconds
+    return None
+
+
+def _norm_direction(value) -> str | None:
+    """Normalize GTFS direction_id values so 0, 0.0, and "0" compare equally."""
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return str(int(float(value)))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _prediction_confidence(best_diff: float, second_diff: float | None, has_sequence: bool, direction_match: bool | None) -> float:
+    # Time is the continuous evidence; structural fields add confidence.
+    score = max(0.0, 1.0 - (best_diff / LOW_CONFIDENCE_SECONDS))
+    if best_diff <= HIGH_CONFIDENCE_SECONDS:
+        score = max(score, 0.95)
+    if has_sequence:
+        score = min(1.0, score + 0.20)
+    if direction_match is True:
+        score = min(1.0, score + 0.10)
+    if second_diff is not None and second_diff - best_diff < AMBIGUITY_MARGIN_SECONDS:
+        score *= 0.55
+    return round(score, 4)
+
+
+def _candidate_matches(predictions: pd.DataFrame, schedule: pd.DataFrame, service_date: str) -> pd.DataFrame:
+    if predictions.empty:
+        return pd.DataFrame()
+
+    # Build small sorted indexes for each service/route/stop/direction/sequence bucket.
+    indexes: dict[tuple, list[dict]] = {}
+    for _, s in schedule.iterrows():
+        base_key = (str(s.route_id), str(s.stop_id), _norm_direction(s.direction_id))
+        for key in (base_key, (str(s.route_id), str(s.stop_id), None)):
+            indexes.setdefault(key, []).append(s.to_dict())
+    for key in indexes:
+        indexes[key].sort(key=lambda x: x["scheduled_arrival_seconds"])
+
+    rows = []
+    window = MATCH_WINDOW_MINUTES * 60
+    for _, r in predictions.iterrows():
+        service_seconds = _prediction_service_seconds(r, service_date)
+        base_output = {
+            "trip_id": r.get("trip_id"),
+            "route_id": r.get("route_id"),
+            "direction": r.get("direction"),
+            "direction_id": r.get("direction_id"),
+            "stop_id": r.get("stop_id"),
+            "stop_sequence": r.get("stop_sequence"),
+            "feed_name": r.get("feed_name"),
+            "predicted_arrival": r.get("predicted_arrival"),
+            "predicted_arrival_utc": r.get("predicted_arrival_utc"),
+            "observed_at": r.get("observed_at"),
+            "observed_at_utc": r.get("observed_at_utc"),
+            "schedule_relationship": r.get("schedule_relationship"),
+            "trip_start_date": r.get("trip_start_date"),
+            "service_date": service_date,
+            "measurement_type": "realtime_prediction",
+            "prediction_service_seconds": service_seconds,
+        }
+        if service_seconds is None or pd.isna(r.get("route_id")):
+            base_output.update({"match_status": "unmatched_prediction", "static_trip_id": None, "scheduled_arrival_seconds": None})
+            rows.append(base_output)
+            continue
+
+        direction_id = _norm_direction(r.get("direction_id"))
+        key = (str(r["route_id"]), str(r["stop_id"]), direction_id)
+        candidates = indexes.get(key, [])
+        if not candidates:
+            candidates = indexes.get((str(r["route_id"]), str(r["stop_id"]), None), [])
+
+        sequence = pd.to_numeric(r.get("stop_sequence"), errors="coerce")
+        if pd.notna(sequence):
+            seq_candidates = [c for c in candidates if pd.notna(c.get("stop_sequence")) and int(c["stop_sequence"]) == int(sequence)]
+            if seq_candidates:
+                candidates = seq_candidates
+
+        if not candidates:
+            base_output.update({"match_status": "unmatched_prediction", "static_trip_id": None, "scheduled_arrival_seconds": None})
+            rows.append(base_output)
+            continue
+
+        times = [int(c["scheduled_arrival_seconds"]) for c in candidates]
+        idx = bisect_left(times, service_seconds)
+        nearby = []
+        for i in range(max(0, idx - 2), min(len(candidates), idx + 3)):
+            diff = abs(times[i] - service_seconds)
+            if diff <= window:
+                nearby.append((diff, candidates[i]))
+        nearby.sort(key=lambda x: (x[0], str(x[1]["static_trip_id"])))
+
+        # Added service is not a data-quality failure when GTFS-RT explicitly says so.
+        relationship = str(r.get("schedule_relationship") or "").upper()
+        if relationship == "ADDED":
+            base_output.update({"match_status": "added_service", "static_trip_id": None, "scheduled_arrival_seconds": None})
+            rows.append(base_output)
+            continue
+        if not nearby and relationship == "DUPLICATED":
+            base_output.update({"match_status": "added_service", "static_trip_id": None, "scheduled_arrival_seconds": None})
+            rows.append(base_output)
+            continue
+
+        if not nearby:
+            base_output.update({"match_status": "unmatched_prediction", "static_trip_id": None, "scheduled_arrival_seconds": None})
+            rows.append(base_output)
+            continue
+
+        best_diff, best = nearby[0]
+        second_diff = nearby[1][0] if len(nearby) > 1 else None
+        direction_match = None
+        if pd.notna(r.get("direction_id")) and pd.notna(best.get("direction_id")):
+            direction_match = int(r["direction_id"]) == int(best["direction_id"])
+        ambiguous = second_diff is not None and (second_diff - best_diff) < AMBIGUITY_MARGIN_SECONDS and best_diff > HIGH_CONFIDENCE_SECONDS
+        status = "ambiguous_prediction" if ambiguous else "matched"
+        confidence = _prediction_confidence(best_diff, second_diff, pd.notna(r.get("stop_sequence")), direction_match)
+
+        base_output.update(
+            {
+                "static_trip_id": best["static_trip_id"],
+                "scheduled_arrival_seconds": int(best["scheduled_arrival_seconds"]),
+                "match_status": status,
+                "match_confidence": confidence,
+                "candidate_count": len(nearby),
+                "candidate_time_gap_seconds": (second_diff - best_diff) if second_diff is not None else None,
+            }
         )
+        base_output["prediction_delay_seconds"] = service_seconds - int(best["scheduled_arrival_seconds"])
+        rows.append(base_output)
+
+    result = pd.DataFrame(rows)
+    if "prediction_delay_seconds" not in result:
+        result["prediction_delay_seconds"] = pd.NA
+    return result
+
+
+def reconcile_date(service_date: str) -> None:
+    date_dir = PROCESSED_DATA_DIR / f"date={service_date}"
+    observations_path = date_dir / "trip_update_observations.parquet"
+    legacy_path = date_dir / "trip_updates.parquet"
+    input_path = observations_path if observations_path.exists() else legacy_path
+    if not input_path.exists():
+        log.warning("No realtime prediction data found for %s - run parse_snapshots first", service_date)
         return
 
-    con = duckdb.connect()
+    try:
+        observations = pd.read_parquet(input_path)
+        schedule = _static_schedule(service_date)
+    except FileNotFoundError as exc:
+        log.warning("%s", exc)
+        return
 
-    # Static schedule times are stored as GTFS's "service-day seconds"
-    # (e.g. "25:14:00" for 1:14am the next service day), which we
-    # convert to a comparable seconds-since-midnight-of-service-day
-    # integer here rather than trying to force it into a wall clock.
-    query = f"""
-        WITH realtime AS (
-            SELECT
-                trip_id,
-                route_id,
-                direction,
-                stop_id,
-                predicted_arrival,
-                line
-            FROM read_parquet('{trip_updates_path}')
-            WHERE predicted_arrival IS NOT NULL
-        ),
-        static AS (
-            SELECT
-                st.trip_id AS static_trip_id,
-                t.route_id AS static_route_id,
-                st.stop_id AS static_stop_id,
-                -- Convert HH:MM:SS (possibly >24h) schedule time to seconds
-                CAST(split_part(st.arrival_time, ':', 1) AS INTEGER) * 3600
-                    + CAST(split_part(st.arrival_time, ':', 2) AS INTEGER) * 60
-                    + CAST(split_part(st.arrival_time, ':', 3) AS INTEGER) AS scheduled_arrival_seconds
-            FROM read_parquet('{stop_times_path}') st
-            JOIN read_parquet('{trips_path}') t ON st.trip_id = t.trip_id
-        )
-        SELECT
-            r.trip_id,
-            r.route_id,
-            r.direction,
-            r.stop_id,
-            r.line,
-            r.predicted_arrival,
-            s.static_trip_id,
-            s.scheduled_arrival_seconds
-        FROM realtime r
-        LEFT JOIN static s
-            ON r.route_id = s.static_route_id
-            AND r.stop_id = s.static_stop_id
-    """
-    joined = con.execute(query).df()
-    log.info("Joined %s realtime x static candidate rows for %s", len(joined), date)
+    if observations.empty:
+        log.warning("No predictions found for %s", service_date)
+        return
 
-    # The time-window matching and "closest match wins" logic is easier
-    # to express clearly in pandas than in a single SQL statement, and
-    # this dataset size (one day, one route/stop pair at a time) is
-    # small enough that this is not a performance concern.
-    import pandas as pd
+    result = _candidate_matches(observations, schedule, service_date)
+    output = date_dir / "reconciled_trips.parquet"
+    result.to_parquet(output, index=False)
 
-    joined["predicted_arrival"] = pd.to_numeric(joined["predicted_arrival"], errors="coerce")
-
-    # predicted_arrival is a unix timestamp; convert to seconds-since-
-    # midnight-UTC-of-that-day so it's comparable to scheduled_arrival_seconds.
-    # NOTE: MTA's static schedule times are in the feed's local service-day
-    # convention; for an MVP we approximate service-day midnight as UTC
-    # midnight of the predicted arrival's date. This is close enough for
-    # delay-minutes-level analysis but worth tightening (proper timezone
-    # handling) before drawing conclusions at the second-level.
-    joined["pred_dt"] = pd.to_datetime(joined["predicted_arrival"], unit="s", utc=True)
-    joined["pred_seconds_since_midnight"] = (
-        joined["pred_dt"].dt.hour * 3600
-        + joined["pred_dt"].dt.minute * 60
-        + joined["pred_dt"].dt.second
-    )
-
-    joined["time_diff_seconds"] = (
-        joined["pred_seconds_since_midnight"] - joined["scheduled_arrival_seconds"]
-    ).abs()
-
-    window_seconds = MATCH_WINDOW_MINUTES * 60
-    within_window = joined[
-        joined["time_diff_seconds"].notna() & (joined["time_diff_seconds"] <= window_seconds)
-    ].copy()
-
-    # For each realtime (trip_id, stop_id), keep the closest static match
-    best_matches = (
-        within_window.sort_values("time_diff_seconds")
-        .drop_duplicates(subset=["trip_id", "stop_id"], keep="first")
-    )
-    best_matches["match_status"] = "matched"
-    best_matches["delay_seconds"] = (
-        best_matches["pred_seconds_since_midnight"] - best_matches["scheduled_arrival_seconds"]
-    )
-
-    # Ghost trains: realtime predictions with no static match at all
-    matched_keys = set(zip(best_matches["trip_id"], best_matches["stop_id"]))
-    all_realtime = joined.drop_duplicates(subset=["trip_id", "stop_id"])
-    unmatched = all_realtime[
-        ~all_realtime.apply(lambda r: (r["trip_id"], r["stop_id"]) in matched_keys, axis=1)
-    ].copy()
-    unmatched["match_status"] = "unmatched_ghost_candidate"
-    unmatched["delay_seconds"] = None
-    unmatched["static_trip_id"] = None
-
-    output_cols = [
-        "trip_id",
-        "route_id",
-        "direction",
-        "stop_id",
-        "line",
-        "static_trip_id",
-        "scheduled_arrival_seconds",
-        "pred_seconds_since_midnight",
-        "delay_seconds",
-        "match_status",
-    ]
-    result = pd.concat([best_matches[output_cols], unmatched[output_cols]], ignore_index=True)
-
-    out_path = PROCESSED_DATA_DIR / f"date={date}" / "reconciled_trips.parquet"
-    result.to_parquet(out_path, index=False)
-
-    matched_pct = 100 * len(best_matches) / max(len(all_realtime), 1)
-    log.info(
-        "Reconciled %s: %s matched (%.1f%%), %s unmatched -> %s",
-        date,
-        len(best_matches),
-        matched_pct,
-        len(unmatched),
-        out_path,
-    )
+    counts = result["match_status"].value_counts().to_dict()
+    log.info("Reconciled %s -> %s (%s)", service_date, output, counts)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--date",
-        type=str,
-        default=(datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d"),
-    )
+    parser.add_argument("--date", type=str, default=(datetime.now(NY_TZ).date() - timedelta(days=1)).isoformat())
     args = parser.parse_args()
     reconcile_date(args.date)
 

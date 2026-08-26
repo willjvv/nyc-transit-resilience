@@ -1,11 +1,4 @@
-"""
-Unit tests for the reconciliation matching logic. Uses small synthetic
-Parquet fixtures written to a temp directory rather than real MTA data,
-so tests run fast and deterministically.
-"""
-import os
-from pathlib import Path
-
+"""Reconciliation tests covering service dates, calendar rules, ambiguity and exceptions."""
 import pandas as pd
 import pytest
 
@@ -14,105 +7,111 @@ from processing import reconcile
 
 @pytest.fixture
 def synthetic_gtfs(tmp_path, monkeypatch):
-    """Build a minimal static schedule + realtime trip_updates fixture
-    covering: an exact match, a delayed-but-matchable train, and an
-    unmatched ghost train."""
     static_dir = tmp_path / "static_gtfs"
-    processed_dir = tmp_path / "processed" / "date=2026-08-25"
+    date_dir = tmp_path / "processed" / "date=2026-08-25"
     static_dir.mkdir(parents=True)
-    processed_dir.mkdir(parents=True)
+    date_dir.mkdir(parents=True)
 
-    trips = pd.DataFrame(
-        [
-            {"trip_id": "SCHED_1", "route_id": "A"},
-            {"trip_id": "SCHED_2", "route_id": "A"},
-        ]
-    )
+    trips = pd.DataFrame([
+        {"trip_id": "SCHED_1", "route_id": "A", "direction_id": 0, "service_id": "WKD"},
+        {"trip_id": "SCHED_2", "route_id": "A", "direction_id": 0, "service_id": "WKD"},
+        {"trip_id": "SUNDAY", "route_id": "A", "direction_id": 0, "service_id": "SUN"},
+    ])
     trips.to_parquet(static_dir / "trips.parquet", index=False)
+    pd.DataFrame([
+        {"trip_id": "SCHED_1", "stop_id": "101", "stop_sequence": 5, "arrival_time": "08:00:00"},
+        {"trip_id": "SCHED_2", "stop_id": "101", "stop_sequence": 5, "arrival_time": "08:10:00"},
+        {"trip_id": "SUNDAY", "stop_id": "101", "stop_sequence": 5, "arrival_time": "08:00:00"},
+    ]).to_parquet(static_dir / "stop_times.parquet", index=False)
+    pd.DataFrame([{
+        "service_id": "WKD", "monday": 1, "tuesday": 1, "wednesday": 1, "thursday": 1,
+        "friday": 1, "saturday": 0, "sunday": 0, "start_date": "20260101", "end_date": "20261231"
+    }, {
+        "service_id": "SUN", "monday": 0, "tuesday": 0, "wednesday": 0, "thursday": 0,
+        "friday": 0, "saturday": 0, "sunday": 1, "start_date": "20260101", "end_date": "20261231"
+    }]).to_parquet(static_dir / "calendar.parquet", index=False)
 
-    stop_times = pd.DataFrame(
-        [
-            # Scheduled for 08:00:00 at stop 101
-            {"trip_id": "SCHED_1", "stop_id": "101", "arrival_time": "08:00:00"},
-            # Scheduled for 08:10:00 at stop 101
-            {"trip_id": "SCHED_2", "stop_id": "101", "arrival_time": "08:10:00"},
-        ]
-    )
-    stop_times.to_parquet(static_dir / "stop_times.parquet", index=False)
-
-    # Realtime predictions:
-    #   - RT_1 at stop 101, predicted 08:00:30 -> should match SCHED_1 (30s delay)
-    #   - RT_2 at stop 101, predicted 08:14:00 -> should match SCHED_2 (4 min delay)
-    #   - RT_3 at stop 101, predicted 09:30:00 -> no schedule within window -> ghost
     base = pd.Timestamp("2026-08-25", tz="UTC")
-    trip_updates = pd.DataFrame(
-        [
-            {
-                "trip_id": "RT_1",
-                "route_id": "A",
-                "direction": "N",
-                "stop_id": "101",
-                "line": "A",
-                "predicted_arrival": int((base + pd.Timedelta(hours=8, seconds=30)).timestamp()),
-            },
-            {
-                "trip_id": "RT_2",
-                "route_id": "A",
-                "direction": "N",
-                "stop_id": "101",
-                "line": "A",
-                "predicted_arrival": int((base + pd.Timedelta(hours=8, minutes=14)).timestamp()),
-            },
-            {
-                "trip_id": "RT_3",
-                "route_id": "A",
-                "direction": "N",
-                "stop_id": "101",
-                "line": "A",
-                "predicted_arrival": int((base + pd.Timedelta(hours=9, minutes=30)).timestamp()),
-            },
-        ]
-    )
-    trip_updates.to_parquet(processed_dir / "trip_updates.parquet", index=False)
+    pd.DataFrame([
+        {"trip_id": "RT_1", "route_id": "A", "direction": "N", "direction_id": 0, "stop_id": "101", "stop_sequence": 5,
+         "feed_name": "ACE", "trip_start_date": "20260825", "schedule_relationship": None,
+         "predicted_arrival": int((base + pd.Timedelta(hours=8, seconds=30)).timestamp()), "predicted_arrival_utc": (base + pd.Timedelta(hours=8, seconds=30)).isoformat(),
+         "observed_at": int((base + pd.Timedelta(hours=7, minutes=55)).timestamp()), "observed_at_utc": (base + pd.Timedelta(hours=7, minutes=55)).isoformat()},
+        {"trip_id": "RT_2", "route_id": "A", "direction": "N", "direction_id": 0, "stop_id": "101", "stop_sequence": 5,
+         "feed_name": "ACE", "trip_start_date": "20260825", "schedule_relationship": None,
+         "predicted_arrival": int((base + pd.Timedelta(hours=8, minutes=14)).timestamp()), "predicted_arrival_utc": (base + pd.Timedelta(hours=8, minutes=14)).isoformat(),
+         "observed_at": int((base + pd.Timedelta(hours=8)).timestamp()), "observed_at_utc": (base + pd.Timedelta(hours=8)).isoformat()},
+    ]).to_parquet(date_dir / "trip_update_observations.parquet", index=False)
 
     monkeypatch.setattr(reconcile, "STATIC_GTFS_DIR", static_dir)
     monkeypatch.setattr(reconcile, "PROCESSED_DATA_DIR", tmp_path / "processed")
-
     return tmp_path / "processed"
 
 
-def test_reconcile_matches_within_window(synthetic_gtfs):
+def test_reconcile_service_date_and_delay(synthetic_gtfs):
     reconcile.reconcile_date("2026-08-25")
-
-    out_path = synthetic_gtfs / "date=2026-08-25" / "reconciled_trips.parquet"
-    assert out_path.exists()
-
-    result = pd.read_parquet(out_path)
-
-    rt1 = result[result["trip_id"] == "RT_1"].iloc[0]
-    assert rt1["match_status"] == "matched"
-    assert rt1["static_trip_id"] == "SCHED_1"
-    assert abs(rt1["delay_seconds"] - 30) < 1
-
-    rt2 = result[result["trip_id"] == "RT_2"].iloc[0]
-    assert rt2["match_status"] == "matched"
-    assert rt2["static_trip_id"] == "SCHED_2"
-    assert abs(rt2["delay_seconds"] - 240) < 1
+    result = pd.read_parquet(synthetic_gtfs / "date=2026-08-25" / "reconciled_trips.parquet")
+    rt1 = result[result.trip_id == "RT_1"].iloc[0]
+    rt2 = result[result.trip_id == "RT_2"].iloc[0]
+    assert rt1.static_trip_id == "SCHED_1"
+    assert rt1.prediction_delay_seconds == 30
+    assert rt2.static_trip_id == "SCHED_2"
+    assert rt2.prediction_delay_seconds == 240
+    assert rt1.measurement_type == "realtime_prediction"
+    assert rt1.service_date == "2026-08-25"
 
 
-def test_reconcile_flags_ghost_trains(synthetic_gtfs):
+def test_after_midnight_maps_to_previous_service_date(tmp_path, monkeypatch):
+    static_dir = tmp_path / "static"; proc = tmp_path / "proc" / "date=2026-08-25"
+    static_dir.mkdir(parents=True); proc.mkdir(parents=True)
+    pd.DataFrame([{"trip_id":"S","route_id":"A","direction_id":0,"service_id":"WKD"}]).to_parquet(static_dir/"trips.parquet", index=False)
+    pd.DataFrame([{"trip_id":"S","stop_id":"1","stop_sequence":1,"arrival_time":"25:15:00"}]).to_parquet(static_dir/"stop_times.parquet", index=False)
+    pd.DataFrame([{"service_id":"WKD","monday":1,"tuesday":1,"wednesday":1,"thursday":1,"friday":1,"saturday":0,"sunday":0,"start_date":"20260101","end_date":"20261231"}]).to_parquet(static_dir/"calendar.parquet", index=False)
+    # 01:15 EDT on Aug 26 belongs to Aug 25 GTFS service day and is 25:15.
+    ts = int(pd.Timestamp("2026-08-26 01:15:00", tz="America/New_York").timestamp())
+    pd.DataFrame([{ "trip_id":"RT","route_id":"A","direction_id":0,"stop_id":"1","stop_sequence":1,
+                    "predicted_arrival":ts,"observed_at":ts-60,"feed_name":"ACE","trip_start_date":"20260825"}]).to_parquet(proc/"trip_update_observations.parquet", index=False)
+    monkeypatch.setattr(reconcile, "STATIC_GTFS_DIR", static_dir); monkeypatch.setattr(reconcile, "PROCESSED_DATA_DIR", tmp_path/"proc")
     reconcile.reconcile_date("2026-08-25")
-
-    out_path = synthetic_gtfs / "date=2026-08-25" / "reconciled_trips.parquet"
-    result = pd.read_parquet(out_path)
-
-    rt3 = result[result["trip_id"] == "RT_3"].iloc[0]
-    assert rt3["match_status"] == "unmatched_ghost_candidate"
-    assert pd.isna(rt3["delay_seconds"])
+    out = pd.read_parquet(proc/"reconciled_trips.parquet").iloc[0]
+    assert out.static_trip_id == "S"
+    assert out.prediction_delay_seconds == 0
 
 
-def test_reconcile_missing_inputs_does_not_raise(tmp_path, monkeypatch):
-    monkeypatch.setattr(reconcile, "STATIC_GTFS_DIR", tmp_path / "nonexistent")
-    monkeypatch.setattr(reconcile, "PROCESSED_DATA_DIR", tmp_path / "also_nonexistent")
-    # Should log a warning and return cleanly, not raise
-    reconcile.reconcile_date("2026-01-01")
+def test_missing_service_date_does_not_use_inactive_schedule(synthetic_gtfs):
+    reconcile.reconcile_date("2026-08-23")
+    # No observations for this service date should be reconciled from Tuesday data.
+    out_path = synthetic_gtfs / "date=2026-08-23" / "reconciled_trips.parquet"
+    assert not out_path.exists()
+
+
+def test_ambiguous_candidates_are_not_silently_assigned():
+    from processing.reconcile import _candidate_matches
+    ts = int(pd.Timestamp("2026-08-25 08:05:00", tz="America/New_York").timestamp())
+    predictions = pd.DataFrame([{
+        "trip_id":"RT", "route_id":"A", "direction_id":0, "direction":"N",
+        "stop_id":"101", "stop_sequence":None, "feed_name":"ACE",
+        "trip_start_date":"20260825", "schedule_relationship":None,
+        "predicted_arrival":ts, "observed_at":ts-60,
+    }])
+    schedule = pd.DataFrame([
+        {"static_trip_id":"S1","route_id":"A","stop_id":"101","direction_id":0,"stop_sequence":5,"service_id":"WKD","service_date":"2026-08-25","scheduled_arrival_seconds":8*3600},
+        {"static_trip_id":"S2","route_id":"A","stop_id":"101","direction_id":0,"stop_sequence":6,"service_id":"WKD","service_date":"2026-08-25","scheduled_arrival_seconds":8*3600+10*60},
+    ])
+    out = _candidate_matches(predictions, schedule, "2026-08-25").iloc[0]
+    assert out.match_status == "ambiguous_prediction"
+    assert out.static_trip_id in {"S1", "S2"}
+
+
+def test_added_service_is_not_called_a_missing_schedule_match():
+    from processing.reconcile import _candidate_matches
+    ts = int(pd.Timestamp("2026-08-25 08:05:00", tz="America/New_York").timestamp())
+    predictions = pd.DataFrame([{
+        "trip_id":"RT", "route_id":"A", "direction_id":0, "direction":"N",
+        "stop_id":"101", "stop_sequence":5, "feed_name":"ACE",
+        "trip_start_date":"20260825", "schedule_relationship":"ADDED",
+        "predicted_arrival":ts, "observed_at":ts-60,
+    }])
+    schedule = pd.DataFrame(columns=["static_trip_id","route_id","stop_id","direction_id","stop_sequence","service_id","service_date","scheduled_arrival_seconds"])
+    out = _candidate_matches(predictions, schedule, "2026-08-25").iloc[0]
+    assert out.match_status == "added_service"
