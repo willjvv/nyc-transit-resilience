@@ -11,9 +11,10 @@ import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import duckdb
+
+from processing.time_utils import NY_TZ
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("metrics")
@@ -123,7 +124,7 @@ def compute_metrics(date: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--date", type=str, default=(datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=1)).isoformat())
+    parser.add_argument("--date", type=str, default=(datetime.now(NY_TZ).date() - timedelta(days=1)).isoformat())
     args = parser.parse_args()
     compute_metrics(args.date)
 

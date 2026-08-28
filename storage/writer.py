@@ -8,8 +8,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -24,7 +25,7 @@ def _feed_message_to_dataframe(message, feed_name: str) -> pd.DataFrame:
     as_dict = MessageToDict(message, preserving_proto_field_name=True)
     entities = as_dict.get("entity", [])
     feed_timestamp = as_dict.get("header", {}).get("timestamp")
-    fetched_at = int(datetime.now(timezone.utc).timestamp())
+    fetched_at = int(datetime.now(ZoneInfo("UTC")).timestamp())
     rows = []
     for entity in entities:
         rows.append(
@@ -42,7 +43,7 @@ def _feed_message_to_dataframe(message, feed_name: str) -> pd.DataFrame:
 
 
 def write_raw_snapshot(feed_name: str, message) -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(ZoneInfo("UTC"))
     partition_dir = (
         RAW_DATA_DIR / f"date={now:%Y-%m-%d}" / f"feed={feed_name}" / f"hour={now:%H}"
     )

@@ -11,6 +11,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
@@ -137,8 +138,10 @@ selected_date = st.selectbox("Date", dates, index=0)
 
 # Data freshness indicator
 try:
-    selected_dt = datetime.strptime(selected_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    today = datetime.now(timezone.utc)
+    from processing.time_utils import NY_TZ
+    # Service dates are New York local dates, not UTC dates
+    selected_dt = datetime.strptime(selected_date, "%Y-%m-%d").replace(tzinfo=NY_TZ)
+    today = datetime.now(NY_TZ)
     days_ago = (today.date() - selected_dt.date()).days
     if days_ago == 0:
         freshness = "🟢 Today's data"
@@ -147,8 +150,8 @@ try:
     else:
         freshness = f"🔴 {days_ago} days old"
     st.caption(f"Data freshness: {freshness}")
-except:
-    st.caption("Data freshness: Unknown")
+except Exception as e:
+    st.caption(f"Data freshness: Unknown (error: {e})")
 
 on_time_df = load_metric(selected_date, "on_time_by_line.parquet")
 delay_df = load_metric(selected_date, "delay_by_hour.parquet")

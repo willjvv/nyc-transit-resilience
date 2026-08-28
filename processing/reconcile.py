@@ -19,8 +19,9 @@ import argparse
 import logging
 import os
 from bisect import bisect_left
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -42,7 +43,8 @@ def _load_active_service_ids(service_date: str) -> set[str]:
     if not calendar_path.exists():
         raise FileNotFoundError(f"Missing {calendar_path}")
 
-    target = datetime.strptime(service_date, "%Y-%m-%d")
+    # Service dates are New York local dates, parse with NY timezone context
+    target = datetime.strptime(service_date, "%Y-%m-%d").replace(tzinfo=NY_TZ).date()
     weekday_column = target.strftime("%A").lower()
     calendar = pd.read_parquet(calendar_path)
     active: set[str] = set()
@@ -57,7 +59,7 @@ def _load_active_service_ids(service_date: str) -> set[str]:
             end_d = datetime.strptime(end, "%Y%m%d").date()
         except ValueError:
             continue
-        if not (start_d <= target.date() <= end_d):
+        if not (start_d <= target <= end_d):
             continue
         if str(row.get(weekday_column, "0")) != "1":
             continue
@@ -190,6 +192,14 @@ def _candidate_matches(predictions: pd.DataFrame, schedule: pd.DataFrame, servic
             rows.append(base_output)
             continue
 
+        # Added service is not a data-quality failure when GTFS-RT explicitly says so.
+        # Check this before candidate matching to avoid false "unmatched" status.
+        relationship = str(r.get("schedule_relationship") or "").upper()
+        if relationship == "ADDED":
+            base_output.update({"match_status": "added_service", "static_trip_id": None, "scheduled_arrival_seconds": None})
+            rows.append(base_output)
+            continue
+
         direction_id = _norm_direction(r.get("direction_id"))
         key = (str(r["route_id"]), str(r["stop_id"]), direction_id)
         candidates = indexes.get(key, [])
@@ -216,12 +226,6 @@ def _candidate_matches(predictions: pd.DataFrame, schedule: pd.DataFrame, servic
                 nearby.append((diff, candidates[i]))
         nearby.sort(key=lambda x: (x[0], str(x[1]["static_trip_id"])))
 
-        # Added service is not a data-quality failure when GTFS-RT explicitly says so.
-        relationship = str(r.get("schedule_relationship") or "").upper()
-        if relationship == "ADDED":
-            base_output.update({"match_status": "added_service", "static_trip_id": None, "scheduled_arrival_seconds": None})
-            rows.append(base_output)
-            continue
         if not nearby and relationship == "DUPLICATED":
             base_output.update({"match_status": "added_service", "static_trip_id": None, "scheduled_arrival_seconds": None})
             rows.append(base_output)
