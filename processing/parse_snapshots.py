@@ -46,16 +46,6 @@ def _safe_mapping(value):
             return None
 
 
-def _has_service_date(value, service_date: str) -> bool:
-    """Check a serialized or in-memory candidate list for a service date."""
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            return False
-    return any(candidate[0] == service_date for candidate in value or [])
-
-
 def _raw_dates_for_service_date(service_date: str) -> list[str]:
     """Load UTC partitions spanning the requested New York service date."""
     d = datetime.strptime(service_date, "%Y-%m-%d").date()
@@ -156,8 +146,7 @@ def extract_trip_updates(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     df["local_date"] = df["predicted_arrival"].map(local_date_from_unix)
     candidates = df["predicted_arrival"].map(service_date_candidates)
-    # Keep nested candidate data portable across parquet engines.
-    df["service_date_candidates"] = candidates.map(json.dumps)
+    df["service_date_candidates"] = candidates
     df["prediction_history_key"] = (
         df["trip_id"].astype(str) + "|" + df["stop_id"].astype(str)
     )
@@ -172,7 +161,7 @@ def latest_trip_updates(observations: pd.DataFrame, service_date: str) -> pd.Dat
     if observations.empty:
         return observations.copy()
     mask = observations["service_date_candidates"].map(
-        lambda candidates: _has_service_date(candidates, service_date)
+        lambda pairs: service_date in {d for d, _ in pairs}
     )
     df = observations.loc[mask].copy()
     if df.empty:
@@ -231,7 +220,7 @@ def main():
 
     observations = extract_trip_updates(raw_df)
     service_mask = observations["service_date_candidates"].map(
-        lambda candidates: _has_service_date(candidates, args.date)
+        lambda pairs: args.date in {d for d, _ in pairs}
     ) if not observations.empty else pd.Series(dtype=bool)
     observations_for_date = observations.loc[service_mask].copy() if not observations.empty else observations
     vehicle_positions = extract_vehicle_positions(raw_df)
@@ -240,9 +229,12 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not observations_for_date.empty:
-        observations_for_date.to_parquet(out_dir / "trip_update_observations.parquet", index=False)
+        persisted_observations = observations_for_date.drop(columns=["service_date_candidates"])
+        persisted_observations.to_parquet(out_dir / "trip_update_observations.parquet", index=False)
         latest = latest_trip_updates(observations_for_date, args.date)
-        latest.to_parquet(out_dir / "trip_updates.parquet", index=False)
+        latest.drop(columns=["service_date_candidates"]).to_parquet(
+            out_dir / "trip_updates.parquet", index=False
+        )
         log.info(
             "Wrote %s prediction observations and %s terminal predictions for service date %s",
             len(observations_for_date), len(latest), args.date,

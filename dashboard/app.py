@@ -1,80 +1,54 @@
-"""NYC subway analytics dashboard.
-
-The dashboard is intentionally organized around user questions instead of
-pipeline internals:
-
-1. Overview   - How is the system doing?
-2. Performance - Where and when are delays concentrated?
-3. Network    - Which stations are structurally important?
-4. Data       - How trustworthy are the measurements?
-
-The underlying metrics are prediction-vs-schedule measurements, not observed
-physical arrivals. The UI keeps that distinction visible without requiring the
-user to understand the pipeline first.
 """
-from __future__ import annotations
+Streamlit dashboard for subway reliability metrics. Reads only from
+processing/metrics.py's output tables - never touches raw or reconciled
+data directly, so this stays fast regardless of how much raw data has
+accumulated.
 
+Usage:
+    streamlit run dashboard/app.py
+"""
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-DASHBOARD_DIR = Path(__file__).parent
-sys.path.insert(0, str(DASHBOARD_DIR))
+# Add dashboard directory to path for imports
+dashboard_dir = Path(__file__).parent
+sys.path.insert(0, str(dashboard_dir))
 
-from explanations import FAQ, THRESHOLDS  # noqa: E402
-
-PROCESSED_DATA_DIR = Path(os.getenv("PROCESSED_DATA_DIR", "data/processed"))
-NYC_TZ = ZoneInfo("America/New_York")
-ON_TIME_TARGET_PCT = THRESHOLDS["on_time_target"]
-QUALITY_WARNING_PCT = THRESHOLDS["quality_warning"]
-
-st.set_page_config(
-    page_title="NYC Subway Analytics",
-    page_icon="🚇",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from explanations import (
+    COLOR_EXPLANATIONS,
+    FAQ,
+    METRIC_EXPLANATIONS,
+    ONBOARDING,
+    THRESHOLDS,
+    get_color_explanation,
+    get_context,
+    get_explanation,
 )
 
-# ----------------------------- Data helpers -----------------------------
+PROCESSED_DATA_DIR = Path(os.getenv("PROCESSED_DATA_DIR", "data/processed"))
+
+st.set_page_config(page_title="NYC subway reliability", layout="wide")
 
 
 def available_dates() -> list[str]:
-    """Return only dates with a completed dashboard metrics artifact.
-
-    Processing creates the date directory before reconciliation/metrics finish,
-    so directory existence alone is not enough to make a date selectable.
-    """
     if not PROCESSED_DATA_DIR.exists():
         return []
-    dates = []
-    for path in PROCESSED_DATA_DIR.iterdir():
-        if not path.is_dir() or not path.name.startswith("date="):
-            continue
-        date = path.name.removeprefix("date=")
-        if (path / "on_time_by_line.parquet").exists():
-            dates.append(date)
-    return sorted(dates, reverse=True)
-
-
-def processing_dates() -> list[str]:
-    """Return date partitions even when processing is incomplete."""
-    if not PROCESSED_DATA_DIR.exists():
-        return []
-    return sorted(
+    dates = sorted(
         [
-            p.name.removeprefix("date=")
+            p.name.replace("date=", "")
             for p in PROCESSED_DATA_DIR.iterdir()
             if p.is_dir() and p.name.startswith("date=")
         ],
         reverse=True,
     )
+    return dates
 
 
 @st.cache_data(ttl=300)
@@ -82,447 +56,525 @@ def load_metric(date: str, filename: str) -> pd.DataFrame:
     path = PROCESSED_DATA_DIR / f"date={date}" / filename
     if not path.exists():
         return pd.DataFrame()
-    with duckdb.connect() as con:
-        return con.execute("SELECT * FROM read_parquet(?)", [str(path)]).df()
+    return duckdb.connect().execute(f"SELECT * FROM read_parquet('{path}')").df()
 
 
-@st.cache_data(ttl=300)
-def load_network() -> pd.DataFrame:
-    path = PROCESSED_DATA_DIR / "critical_stations.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(path)
+# Reference thresholds shown throughout the dashboard - keep these in
+# sync with processing/metrics.py's ON_TIME_THRESHOLD_SECONDS if you
+# change it there.
+ON_TIME_TARGET_PCT = 90  # MTA's own public benchmark, roughly
+GHOST_WARNING_PCT = 10   # above this, likely a feed/matching issue worth investigating
 
 
-def safe_float(value, default=None):
-    try:
-        result = float(value)
-        return default if pd.isna(result) else result
-    except (TypeError, ValueError):
-        return default
+def color_for_on_time(pct: float) -> str:
+    """Green/amber/red so a glance tells you good vs. bad, not just a number."""
+    if pct >= ON_TIME_TARGET_PCT:
+        return "#1D9E75"  # teal - meets target
+    elif pct >= ON_TIME_TARGET_PCT - 15:
+        return "#EF9F27"  # amber - close but under
+    return "#E24B4A"  # red - well under target
 
 
-def freshness_label(date: str) -> str:
-    try:
-        selected = datetime.strptime(date, "%Y-%m-%d").date()
-        today = datetime.now(NYC_TZ).date()
-        age = (today - selected).days
-        if age == 0:
-            return "Today"
-        if age == 1:
-            return "Yesterday"
-        return f"{age} days old"
-    except ValueError:
-        return "Unknown"
+def color_for_ghost(pct: float) -> str:
+    return "#E24B4A" if pct >= GHOST_WARNING_PCT else "#888780"
 
 
-def overall_on_time(df: pd.DataFrame):
-    if df.empty or "matched_count" not in df or "on_time_count" not in df:
-        return None
-    matched = pd.to_numeric(df["matched_count"], errors="coerce").sum()
-    on_time = pd.to_numeric(df["on_time_count"], errors="coerce").sum()
-    return 100.0 * on_time / matched if matched else None
+st.title("NYC subway reliability")
+st.caption(
+    "MTA GTFS-realtime arrival predictions reconciled against the active static schedule."
+)
 
+# View toggle
+view_mode = st.radio(
+    "View Mode",
+    ["Simple View", "Advanced View"],
+    horizontal=True,
+    help="Simple View focuses on key metrics for daily commuters. Advanced View includes detailed analysis for power users."
+)
 
-def weighted_avg_delay(df: pd.DataFrame):
-    if df.empty or "matched_count" not in df or "avg_prediction_delay_minutes" not in df:
-        return None
-    weights = pd.to_numeric(df["matched_count"], errors="coerce").fillna(0)
-    values = pd.to_numeric(df["avg_prediction_delay_minutes"], errors="coerce")
-    total = weights.sum()
-    return float((values.fillna(0) * weights).sum() / total) if total else None
+# Onboarding section (collapsible)
+with st.expander("📖 What is this dashboard?"):
+    st.markdown(ONBOARDING["what_is_this"]["content"])
+    st.markdown(ONBOARDING["data_source"]["content"])
+    st.markdown(ONBOARDING["how_to_use"]["content"])
 
+# FAQ section (collapsible)
+with st.expander("❓ Frequently Asked Questions"):
+    for item in FAQ:
+        st.markdown(f"**Q: {item['question']}**")
+        st.markdown(item['answer'])
+        st.markdown("---")
 
-def overall_quality(df: pd.DataFrame):
-    if df.empty or "total_predictions" not in df:
-        return None
-    total = pd.to_numeric(df["total_predictions"], errors="coerce").fillna(0).sum()
-    issues = (
-        pd.to_numeric(df.get("unmatched_count", 0), errors="coerce").fillna(0)
-        + pd.to_numeric(df.get("ambiguous_count", 0), errors="coerce").fillna(0)
-    ).sum()
-    return 100.0 * issues / total if total else None
+# Simple view specific help
+if view_mode == "Simple View":
+    st.info("💡 **Simple View** shows the key metrics that matter most for daily commuters. Switch to Advanced View for detailed analysis.")
 
-
-def performance_label(on_time: float | None) -> str:
-    if on_time is None:
-        return "No data"
-    if on_time >= ON_TIME_TARGET_PCT:
-        return "Good"
-    if on_time >= THRESHOLDS["on_time_warning"]:
-        return "Needs attention"
-    return "Poor"
-
-
-def status_emoji(on_time: float | None) -> str:
-    label = performance_label(on_time)
-    return {"Good": "🟢", "Needs attention": "🟡", "Poor": "🔴"}.get(label, "⚪")
-
-
-def route_column(df: pd.DataFrame) -> str:
-    if "route_id" in df.columns:
-        return "route_id"
-    return "line" if "line" in df.columns else "route_id"
-
-
-def route_name(value) -> str:
-    text = str(value)
-    return text.replace("SIR", "Staten Island Railway")
-
-
-def chart_theme(fig, height=420):
-    fig.update_layout(
-        height=height,
-        margin=dict(l=10, r=10, t=45, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        hoverlabel=dict(namelength=-1),
-    )
-    fig.update_xaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
-    fig.update_yaxes(showgrid=False)
-    return fig
-
-
-def show_metric_explanation(label: str, text: str):
-    with st.popover(f"About {label}"):
-        st.markdown(text)
-
-
-def line_bar(df: pd.DataFrame):
-    if df.empty:
-        st.warning("Line performance has not been generated for this service date yet.")
-        st.caption("Choose another completed date, or run the parse → reconcile → metrics steps for this date.")
-        return
-    route_col = route_column(df)
-    plot_df = df[[route_col, "on_time_pct"]].copy()
-    plot_df[route_col] = plot_df[route_col].map(route_name)
-    plot_df["on_time_pct"] = pd.to_numeric(plot_df["on_time_pct"], errors="coerce")
-    plot_df = plot_df.dropna(subset=["on_time_pct"]).sort_values("on_time_pct")
-    fig = px.bar(
-        plot_df,
-        x="on_time_pct",
-        y=route_col,
-        orientation="h",
-        text="on_time_pct",
-        labels={route_col: "Line", "on_time_pct": "On schedule (%)"},
-    )
-    fig.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-    fig.add_vline(x=ON_TIME_TARGET_PCT, line_dash="dash", annotation_text="90% target", annotation_position="top")
-    fig.update_xaxes(range=[0, 105])
-    chart_theme(fig, 430)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-
-def delay_timeline(df: pd.DataFrame, selected_line: str | None = None):
-    if df.empty:
-        st.info("No hourly delay data is available for this date.")
-        return
-    route_col = route_column(df)
-    plot_df = df.copy()
-    if selected_line and selected_line != "All lines":
-        plot_df = plot_df[plot_df[route_col].astype(str) == selected_line]
-    if plot_df.empty:
-        st.info("No delay observations match the selected line.")
-        return
-    fig = px.line(
-        plot_df.sort_values([route_col, "hour_of_day"]),
-        x="hour_of_day",
-        y="median_prediction_delay_minutes" if "median_prediction_delay_minutes" in plot_df.columns else "avg_prediction_delay_minutes",
-        color=route_col if selected_line == "All lines" or selected_line is None else None,
-        markers=True,
-        labels={
-            "hour_of_day": "Hour",
-            "median_prediction_delay_minutes": "Median predicted delay (min)",
-            "avg_prediction_delay_minutes": "Average predicted delay (min)",
-            route_col: "Line",
-        },
-    )
-    fig.add_hline(y=5, line_dash="dash", annotation_text="5-minute on-time threshold", annotation_position="top left")
-    fig.update_xaxes(dtick=2, range=[0, 23])
-    chart_theme(fig, 460)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-
-def render_about_data():
-    st.markdown("### How the numbers are made")
-    st.markdown(
-        "This dashboard compares **GTFS-realtime arrival predictions** with the active static schedule. "
-        "A prediction is not the same thing as an observed physical arrival. Daily performance uses the "
-        "terminal prediction observed for each matched trip and stop."
-    )
-    with st.expander("What counts as on schedule?", expanded=False):
-        st.write(
-            f"A matched prediction is considered on schedule when its predicted arrival is within "
-            f"±5 minutes of the published schedule. The 90% reference target is used as a visual benchmark, "
-            "not as an MTA-certified service standard."
+# Legacy help text for advanced view
+if view_mode == "Advanced View":
+    with st.expander("How to read this dashboard"):
+        st.markdown(
+            f"""
+- **On-time %**: share of arrivals within 5 minutes of the scheduled time.
+  Green = at or above {ON_TIME_TARGET_PCT}% (a reasonable target), amber = close,
+  red = notably underperforming.
+- **Prediction matching issue rate**: % of terminal realtime predictions that are
+  unmatched or ambiguous against the active schedule. Extra service and schedule
+  changes can be legitimate; elevated values are primarily a data-quality signal.
+- **Delay by hour**: average minutes late, by hour of day. Use this to spot
+  *when* a line breaks down, not just whether it's reliable overall.
+            """
         )
-    with st.expander("How are realtime trains matched to the schedule?", expanded=False):
-        st.write(
-            "The reconciliation engine first restricts candidates to the active service date and route/stop, "
-            "then uses direction, sequence and time evidence. Matches that are weak or genuinely ambiguous "
-            "are retained as quality flags rather than being silently forced into a scheduled trip."
-        )
-    with st.expander("What does data quality mean?", expanded=False):
-        st.write(
-            "The quality rate is the share of terminal realtime predictions that were unmatched or ambiguous. "
-            "It is a measurement-quality signal: an unmatched prediction can represent added service, a schedule "
-            "change, or insufficient matching evidence. It does not mean that a train disappeared."
-        )
-
-
-# ----------------------------- Layout -----------------------------
 
 dates = available_dates()
-all_processing_dates = processing_dates()
-
-with st.sidebar:
-    st.title("🚇 NYC Subway Analytics")
-    st.caption("Realtime prediction vs. schedule")
-    page = st.radio("Explore", ["Overview", "Performance", "Network", "Data"], label_visibility="collapsed")
-    st.divider()
-    if dates:
-        selected_date = st.selectbox("Service date", dates, index=0)
-        st.caption(f"Data age: **{freshness_label(selected_date)}**")
-    else:
-        selected_date = None
-    st.divider()
-    st.caption("Source: MTA GTFS / GTFS-Realtime")
-
 if not dates:
-    st.title("NYC Subway Analytics")
-    if all_processing_dates:
-        st.warning("The pipeline has created data partitions, but none has completed daily line metrics yet.")
-        latest = all_processing_dates[0]
-        st.info(
-            f"Latest processing partition: **{latest}**. "
-            "Run reconciliation and metrics for that date, then refresh the dashboard."
-        )
-        st.code(f"python -m processing.reconcile --date {latest}\npython -m processing.metrics --date {latest}", language="bash")
-    else:
-        st.warning("No processed data found yet. Run the pipeline before opening the dashboard.")
-        st.code("bash scripts/run_local.sh", language="bash")
+    st.warning(
+        "No processed data found yet. Run the pipeline first: "
+        "`bash scripts/run_local.sh`"
+    )
     st.stop()
+
+selected_date = st.selectbox("Date", dates, index=0)
+
+# Data freshness indicator
+try:
+    selected_dt = datetime.strptime(selected_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    today = datetime.now(timezone.utc)
+    days_ago = (today.date() - selected_dt.date()).days
+    if days_ago == 0:
+        freshness = "🟢 Today's data"
+    elif days_ago == 1:
+        freshness = "🟡 Yesterday's data"
+    else:
+        freshness = f"🔴 {days_ago} days old"
+    st.caption(f"Data freshness: {freshness}")
+except:
+    st.caption("Data freshness: Unknown")
 
 on_time_df = load_metric(selected_date, "on_time_by_line.parquet")
 delay_df = load_metric(selected_date, "delay_by_hour.parquet")
-quality_df = load_metric(selected_date, "prediction_quality_by_line.parquet")
-if quality_df.empty:
-    # Backward compatibility for metrics generated before the quality-table rename.
-    quality_df = load_metric(selected_date, "ghost_rate_by_line.parquet")
-network_df = load_network()
+ghost_df = load_metric(selected_date, "prediction_quality_by_line.parquet")
+if ghost_df.empty:
+    ghost_df = load_metric(selected_date, "ghost_rate_by_line.parquet")
 
-system_on_time = overall_on_time(on_time_df)
-system_delay = weighted_avg_delay(on_time_df)
-system_quality = overall_quality(quality_df)
+# Color coding legend
+st.markdown("### Performance Legend")
+col_legend = st.columns(3)
+with col_legend[0]:
+    st.markdown(f"{COLOR_EXPLANATIONS['green']['emoji']} **Good** - {COLOR_EXPLANATIONS['green']['meaning']}")
+with col_legend[1]:
+    st.markdown(f"{COLOR_EXPLANATIONS['amber']['emoji']} **Acceptable** - {COLOR_EXPLANATIONS['amber']['meaning']}")
+with col_legend[2]:
+    st.markdown(f"{COLOR_EXPLANATIONS['red']['emoji']} **Poor** - {COLOR_EXPLANATIONS['red']['meaning']}")
+st.divider()
 
-st.title({
-    "Overview": "NYC Subway: How is the system doing?",
-    "Performance": "Performance: Where are delays concentrated?",
-    "Network": "Network: Which stations matter most?",
-    "Data": "Data: How trustworthy are these measurements?",
-}[page])
-st.caption(f"Service date: {selected_date} · Data age: {freshness_label(selected_date)} · Completed metrics")
+# Main metrics section
+if view_mode == "Simple View":
+    # Simple view: Focus on 3 key metrics for riders
+    st.markdown("### 🚇 Key Metrics for Today's Commute")
 
-# ----------------------------- Overview -----------------------------
-if page == "Overview":
-    st.markdown("## The big picture")
-    if system_on_time is None:
-        st.info("There is not enough matched prediction data to summarize this date.")
-    else:
-        status = performance_label(system_on_time)
-        cols = st.columns(3)
-        with cols[0]:
-            st.metric("On schedule", f"{system_on_time:.1f}%")
-            st.caption(f"{status_emoji(system_on_time)} {status} · 90% visual target")
-        with cols[1]:
-            st.metric("Typical predicted delay", f"{system_delay:.1f} min" if system_delay is not None else "—")
-            st.caption("Weighted average across matched trip-stop predictions")
-        with cols[2]:
-            best = on_time_df.sort_values("on_time_pct", ascending=False).iloc[0] if not on_time_df.empty else None
-            st.metric("Most on-schedule line", route_name(best[route_column(on_time_df)]) if best is not None else "—")
-            if best is not None:
-                st.caption(f"{safe_float(best['on_time_pct']):.1f}% on schedule")
+    col1, col2, col3 = st.columns(3)
 
-        st.divider()
-        st.markdown("## Where are problems showing up?")
-        line_bar(on_time_df)
-        st.caption("Lines are ranked by the share of matched realtime predictions within ±5 minutes of schedule.")
+    with col1:
+        overall_on_time = (
+            100.0 * on_time_df["on_time_count"].sum() / on_time_df["matched_count"].sum()
+            if not on_time_df.empty and on_time_df["matched_count"].sum() else None
+        )
+        emoji = COLOR_EXPLANATIONS['green']['emoji'] if overall_on_time and overall_on_time >= ON_TIME_TARGET_PCT else (
+            COLOR_EXPLANATIONS['amber']['emoji'] if overall_on_time and overall_on_time >= ON_TIME_TARGET_PCT - 15 else COLOR_EXPLANATIONS['red']['emoji']
+        )
+        st.metric(
+            f"{emoji} Trains On Schedule",
+            f"{overall_on_time:.1f}%" if overall_on_time is not None else "n/a",
+            delta=f"{overall_on_time - ON_TIME_TARGET_PCT:.1f} pts vs {ON_TIME_TARGET_PCT}% target"
+            if overall_on_time is not None
+            else None,
+            help=get_explanation("on_time_performance", "simple")
+        )
+        if overall_on_time is not None:
+            st.caption(get_context("on_time_performance"))
 
-        worst = on_time_df.sort_values("on_time_pct").head(3) if not on_time_df.empty else pd.DataFrame()
-        if not worst.empty:
-            st.markdown("### Lines needing the most attention")
-            for _, row in worst.iterrows():
-                line = route_name(row[route_column(on_time_df)])
-                pct = safe_float(row["on_time_pct"], 0)
-                st.write(f"**{line}** — {pct:.1f}% on schedule")
-
-        st.divider()
-        st.markdown("## What do these numbers mean?")
-        render_about_data()
-
-# ----------------------------- Performance -----------------------------
-elif page == "Performance":
-    st.markdown("Choose a line to inspect timing patterns rather than scanning every series at once.")
-    route_col = route_column(delay_df if not delay_df.empty else on_time_df)
-    line_values = []
-    if route_col in delay_df.columns:
-        line_values = sorted(delay_df[route_col].dropna().astype(str).unique().tolist())
-    elif route_col in on_time_df.columns:
-        line_values = sorted(on_time_df[route_col].dropna().astype(str).unique().tolist())
-    selected_line = st.selectbox("Line", ["All lines"] + line_values)
-
-    filtered_on_time = on_time_df.copy()
-    if selected_line != "All lines" and route_col in filtered_on_time.columns:
-        filtered_on_time = filtered_on_time[filtered_on_time[route_col].astype(str) == selected_line]
-
-    cols = st.columns(3)
-    perf_pct = safe_float(filtered_on_time.iloc[0]["on_time_pct"]) if len(filtered_on_time) == 1 else system_on_time
-    perf_delay = safe_float(filtered_on_time.iloc[0].get("avg_prediction_delay_minutes")) if len(filtered_on_time) == 1 else system_delay
-    perf_quality = None
-    if selected_line != "All lines" and not quality_df.empty:
-        qcol = route_column(quality_df)
-        match = quality_df[quality_df[qcol].astype(str) == selected_line]
-        if not match.empty:
-            perf_quality = safe_float(match.iloc[0].get("data_quality_issue_pct"))
-    else:
-        perf_quality = system_quality
-
-    with cols[0]:
-        st.metric("On schedule", f"{perf_pct:.1f}%" if perf_pct is not None else "—")
-    with cols[1]:
-        st.metric("Average predicted delay", f"{perf_delay:.1f} min" if perf_delay is not None else "—")
-    with cols[2]:
-        st.metric("Unmatched / ambiguous", f"{perf_quality:.1f}%" if perf_quality is not None else "—")
-
-    st.divider()
-    st.markdown("## When are delays worst?")
-    st.caption("Use the line selector to turn a crowded multi-line chart into a focused view.")
-    delay_timeline(delay_df, selected_line)
-
-    st.divider()
-    st.markdown("## How each line compares")
-    line_bar(on_time_df)
-
-    st.divider()
-    with st.expander("Prediction-matching quality by line"):
-        if quality_df.empty:
-            st.info("No prediction-quality data is available.")
+    with col2:
+        if not on_time_df.empty:
+            worst_row = on_time_df.sort_values("on_time_pct").iloc[0]
+            best_row = on_time_df.sort_values("on_time_pct", ascending=False).iloc[0]
+            st.metric(
+                "Most Reliable Line",
+                best_row["line"],
+                delta=f"{best_row['on_time_pct']:.1f}% on-time",
+                delta_color="normal",
+                help=get_explanation("reliable_lines", "simple")
+            )
         else:
-            qcol = route_column(quality_df)
-            qview = quality_df[[qcol, "total_predictions", "unmatched_count", "ambiguous_count", "added_service_count", "data_quality_issue_pct"]].copy()
-            qview = qview.rename(columns={
-                qcol: "Line",
-                "total_predictions": "Predictions",
-                "unmatched_count": "Unmatched",
-                "ambiguous_count": "Ambiguous",
-                "added_service_count": "Added service",
-                "data_quality_issue_pct": "Quality issue %",
-            })
-            st.dataframe(qview, use_container_width=True, hide_index=True)
-            st.caption(f"Values above {QUALITY_WARNING_PCT}% deserve investigation; they are not proof of missing trains.")
+            st.metric("Most Reliable Line", "n/a")
 
-# ----------------------------- Network -----------------------------
-elif page == "Network":
-    st.markdown("## Which stations are structurally important?")
-    st.caption("The network model uses consecutive scheduled stop pairs and scheduled running time as edge distance.")
+    with col3:
+        if not on_time_df.empty:
+            avg_delay = (
+                (on_time_df["avg_delay_minutes"] * on_time_df["matched_count"]).sum()
+                / on_time_df["matched_count"].sum()
+                if on_time_df["matched_count"].sum() else float("nan")
+            )
+            delay_emoji = COLOR_EXPLANATIONS['green']['emoji'] if avg_delay <= THRESHOLDS['delay_good'] else (
+                COLOR_EXPLANATIONS['amber']['emoji'] if avg_delay <= THRESHOLDS['delay_concern'] else COLOR_EXPLANATIONS['red']['emoji']
+            )
+            st.metric(
+                f"{delay_emoji} Average Delay",
+                f"{avg_delay:.1f} min" if not pd.isna(avg_delay) else "n/a",
+                delta="normal" if avg_delay <= THRESHOLDS['delay_good'] else "elevated",
+                delta_color="normal" if avg_delay <= THRESHOLDS['delay_good'] else "inverse",
+                help=get_explanation("average_delay", "simple")
+            )
+            if not pd.isna(avg_delay):
+                st.caption(get_context("average_delay"))
+        else:
+            st.metric("Average Delay", "n/a")
 
-    if network_df.empty:
-        st.warning("No network analysis data found. Run `python -m processing.network_analysis` first.")
+    st.divider()
+    st.markdown("### 📊 Line-by-Line Performance")
+
+    # Simplified on-time chart for simple view
+    if not on_time_df.empty:
+        sorted_df = on_time_df.sort_values("on_time_pct")
+        colors = [color_for_on_time(v) for v in sorted_df["on_time_pct"]]
+        emojis = [COLOR_EXPLANATIONS['green']['emoji'] if v >= ON_TIME_TARGET_PCT else (
+            COLOR_EXPLANATIONS['amber']['emoji'] if v >= ON_TIME_TARGET_PCT - 15 else COLOR_EXPLANATIONS['red']['emoji']
+        ) for v in sorted_df["on_time_pct"]]
+
+        # Add emoji to line names
+        sorted_df = sorted_df.copy()
+        sorted_df['line_with_emoji'] = [f"{emoji} {line}" for emoji, line in zip(emojis, sorted_df['line'])]
+
+        fig = px.bar(
+            sorted_df,
+            x="on_time_pct",
+            y="line_with_emoji",
+            orientation="h",
+            text="on_time_pct",
+            labels={"on_time_pct": "On-time %", "line_with_emoji": "Line"},
+        )
+        fig.update_traces(marker_color=colors, texttemplate="%{text:.0f}%", textposition="outside")
+        fig.add_vline(
+            x=ON_TIME_TARGET_PCT,
+            line_dash="dash",
+            line_color="gray",
+            annotation_text="target",
+            annotation_position="top",
+        )
+        fig.update_layout(xaxis_range=[0, 105], margin=dict(l=0, r=20, t=20, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Green bars meet the 90% on-time target. Hover over bars for exact percentages.")
     else:
-        top = network_df.head(10).copy()
-        cols = st.columns(3)
-        for idx, title in enumerate(["Most important station", "Second", "Third"]):
-            with cols[idx]:
-                row = top.iloc[idx]
-                st.metric(title, str(row["stop_name"]))
-                st.caption(f"Criticality score {safe_float(row['combined_score'], 0):.2f}")
+        st.info("No on-time data for this date.")
 
-        st.divider()
-        st.markdown("## Station importance map")
-        fig = px.scatter_mapbox(
-            network_df,
+else:
+    # Advanced view: All current metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        overall_on_time = (
+            100.0 * on_time_df["on_time_count"].sum() / on_time_df["matched_count"].sum()
+            if not on_time_df.empty and on_time_df["matched_count"].sum() else None
+        )
+        st.metric(
+            "System-wide on-time %",
+            f"{overall_on_time:.1f}%" if overall_on_time is not None else "n/a",
+            delta=f"{overall_on_time - ON_TIME_TARGET_PCT:.1f} pts vs {ON_TIME_TARGET_PCT}% target"
+            if overall_on_time is not None
+            else None,
+            help=get_explanation("on_time_performance", "detailed")
+        )
+    with col2:
+        if not on_time_df.empty:
+            worst_row = on_time_df.sort_values("on_time_pct").iloc[0]
+            st.metric(
+                "Least reliable line today",
+                worst_row["line"],
+                delta=f"{worst_row['on_time_pct']:.1f}% on-time",
+                delta_color="off",
+                help=get_explanation("reliable_lines", "detailed")
+            )
+        else:
+            st.metric("Least reliable line today", "n/a")
+    with col3:
+        avg_ghost = (
+            100.0 * ghost_df["unmatched_count"].add(ghost_df["ambiguous_count"]).sum()
+            / ghost_df["total_predictions"].sum()
+            if not ghost_df.empty and ghost_df["total_predictions"].sum() else None
+        )
+        st.metric(
+            "Avg unmatched/ambiguous rate",
+            f"{avg_ghost:.1f}%" if avg_ghost is not None else "n/a",
+            delta="check matching logic" if (avg_ghost or 0) >= GHOST_WARNING_PCT else "normal range",
+            delta_color="off",
+            help=get_explanation("ghost_trains", "detailed")
+        )
+
+    st.divider()
+
+    left, right = st.columns(2)
+
+    with left:
+        st.subheader("On-time % by line")
+        st.caption(f"Green = meets the {ON_TIME_TARGET_PCT}% target, red = underperforming")
+        if not on_time_df.empty:
+            sorted_df = on_time_df.sort_values("on_time_pct")
+            colors = [color_for_on_time(v) for v in sorted_df["on_time_pct"]]
+            fig = px.bar(
+                sorted_df,
+                x="on_time_pct",
+                y="line",
+                orientation="h",
+                text="on_time_pct",
+                labels={"on_time_pct": "On-time %", "line": "Line"},
+            )
+            fig.update_traces(marker_color=colors, texttemplate="%{text:.0f}%", textposition="outside")
+            fig.add_vline(
+                x=ON_TIME_TARGET_PCT,
+                line_dash="dash",
+                line_color="gray",
+                annotation_text="target",
+                annotation_position="top",
+            )
+            fig.update_layout(xaxis_range=[0, 105], margin=dict(l=0, r=20, t=20, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No on-time data for this date.")
+
+    with right:
+        st.subheader("Unmatched/ambiguous predictions by line")
+        st.caption(f"Red = above {GHOST_WARNING_PCT}%, likely worth investigating")
+        if not ghost_df.empty:
+            quality_col = "data_quality_issue_pct" if "data_quality_issue_pct" in ghost_df.columns else "ghost_pct"
+            sorted_df = ghost_df.sort_values(quality_col, ascending=False)
+            colors = [color_for_ghost(v) for v in sorted_df[quality_col]]
+            fig = px.bar(
+                sorted_df,
+                x=quality_col,
+                y="line",
+                orientation="h",
+                text=quality_col,
+                labels={quality_col: "Prediction matching issue %", "line": "Line"},
+            )
+            fig.update_traces(marker_color=colors, texttemplate="%{text:.0f}%", textposition="outside")
+            fig.update_layout(margin=dict(l=0, r=20, t=20, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No prediction-quality data for this date.")
+
+    st.divider()
+    st.subheader("Average delay by hour of day")
+    st.caption(
+        "One line per subway line. Hover to isolate one - with 8+ lines this gets "
+        "busy, so use the legend to toggle lines on/off."
+    )
+    if not delay_df.empty:
+        fig = px.line(
+            delay_df.sort_values(["line", "hour_of_day"]),
+            x="hour_of_day",
+            y="avg_delay_minutes",
+            color="line",
+            labels={"hour_of_day": "Hour of day", "avg_delay_minutes": "Avg delay (min)"},
+        )
+        fig.add_hline(
+            y=5,
+            line_dash="dash",
+            line_color="gray",
+            annotation_text="5-min on-time threshold",
+            annotation_position="top left",
+        )
+        fig.update_traces(mode="lines+markers", marker=dict(size=4))
+        fig.update_layout(
+            legend_title_text="Line",
+            xaxis=dict(dtick=2, title="Hour of day (24h)"),
+            margin=dict(l=0, r=0, t=20, b=0),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No delay data for this date.")
+
+    st.divider()
+
+    # Network Resilience Section
+    st.subheader("🌐 Network Resilience Analysis")
+    st.caption("System-wide connectivity and critical station analysis")
+
+    # Add network resilience onboarding
+    with st.expander("📖 Understanding Network Resilience"):
+        st.markdown(ONBOARDING["network_resilience_info"]["content"])
+
+    # Load critical stations data
+    critical_stations_path = PROCESSED_DATA_DIR / "critical_stations.parquet"
+    if critical_stations_path.exists():
+        critical_df = pd.read_parquet(critical_stations_path)
+
+        # Map visualization
+        st.markdown("### 🗺️ Critical Stations Map")
+        st.caption("Station size and color indicate network importance (red = most critical)")
+
+        # Centrality metric selector for visualization
+        centrality_metric = st.selectbox(
+            "Color stations by:",
+            ["Betweenness Centrality", "Degree Centrality", "Closeness Centrality", "Combined Score"],
+            help="Choose which centrality metric to visualize on the map"
+        )
+
+        metric_map = {
+            "Betweenness Centrality": "betweenness_centrality",
+            "Degree Centrality": "degree_centrality",
+            "Closeness Centrality": "closeness_centrality",
+            "Combined Score": "combined_score"
+        }
+
+        selected_metric = metric_map[centrality_metric]
+
+        # Create map visualization
+        fig_map = px.scatter_mapbox(
+            critical_df,
             lat="stop_lat",
             lon="stop_lon",
+            color=selected_metric,
             size="combined_score",
-            color="combined_score",
             hover_name="stop_name",
             hover_data={
                 "rank": True,
-                "route_count": True,
-                "combined_score": ":.2f",
-                "stop_lat": False,
-                "stop_lon": False,
+                "routes_served": True,
+                "betweenness_centrality": ":.3f",
+                "degree_centrality": ":.3f",
+                "route_count": True
             },
-            labels={"rank": "Network rank", "route_count": "Lines served", "combined_score": "Importance"},
-            color_continuous_scale="RdYlGn_r",
-            zoom=9.8,
-            center={"lat": 40.72, "lon": -73.98},
-            size_max=22,
+            color_continuous_scale="RdYlGn_r",  # Red (high) to Green (low)
+            size_max=20,
+            zoom=10,
+            center={"lat": 40.7128, "lon": -74.0060},  # NYC center
+            labels={
+                "stop_name": "Station",
+                "rank": "Criticality Rank",
+                "routes_served": "Routes",
+                "route_count": "Route Count",
+                "betweenness_centrality": "Betweenness",
+                "degree_centrality": "Degree"
+            }
         )
-        fig.update_layout(mapbox_style="open-street-map", height=570, margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        st.caption("Larger / redder markers indicate higher modeled network importance. This is not a live delay map.")
 
-        with st.expander("Why does a station rank highly?", expanded=False):
-            st.markdown(
-                "The score combines several structural measures: how often a station sits on shortest paths "
-                "(betweenness), how connected it is, how centrally accessible it is, and how strongly it connects "
-                "to other well-connected stations. These are network measures—not predictions of passenger impact."
-            )
+        fig_map.update_layout(
+            mapbox_style="open-street-map",
+            height=500,
+            margin=dict(l=0, r=0, t=30, b=0),
+            coloraxis_colorbar=dict(title=centrality_metric)
+        )
 
-        st.markdown("## Top critical stations")
-        view = network_df.head(25).copy()
-        view["Routes"] = view["routes_served"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
-        view = view.rename(columns={
-            "rank": "Rank",
-            "stop_name": "Station",
-            "route_count": "Lines served",
-            "combined_score": "Importance",
-            "betweenness_centrality": "Betweenness",
-            "closeness_centrality": "Closeness",
+        st.plotly_chart(fig_map, use_container_width=True)
+        st.caption("💡 Larger, redder stations are more critical for network connectivity. Hover for details.")
+
+        st.divider()
+
+        # Critical stations ranking table
+        st.markdown("### 📊 Critical Stations Ranking")
+        st.caption("Top 50 most critical stations for network connectivity")
+
+        # Show top 50 stations
+        top_stations = critical_df.head(50).copy()
+        top_stations['routes_display'] = top_stations['routes_served'].apply(lambda x: ', '.join(x) if isinstance(x, list) else str(x))
+
+        display_columns = {
+            'rank': 'Rank',
+            'stop_name': 'Station Name',
+            'routes_display': 'Routes Served',
+            'route_count': 'Route Count',
+            'betweenness_centrality': 'Betweenness',
+            'degree_centrality': 'Degree',
+            'closeness_centrality': 'Closeness',
+            'combined_score': 'Criticality Score'
+        }
+
+        display_df = top_stations[list(display_columns.keys())].rename(columns=display_columns)
+        display_df = display_df.round({
+            'Betweenness': 3,
+            'Degree': 3,
+            'Closeness': 3,
+            'Criticality Score': 3
         })
+
         st.dataframe(
-            view[["Rank", "Station", "Routes", "Lines served", "Importance", "Betweenness", "Closeness"]].round(3),
+            display_df,
             use_container_width=True,
             hide_index=True,
+            column_config={
+                "Rank": st.column_config.NumberColumn("Rank", help="Lower rank = more critical"),
+                "Criticality Score": st.column_config.NumberColumn("Score", help="Combined centrality metric"),
+                "Betweenness": st.column_config.NumberColumn("Betweenness", help="Network flow importance"),
+                "Degree": st.column_config.NumberColumn("Degree", help="Connection diversity"),
+                "Closeness": st.column_config.NumberColumn("Closeness", help="Accessibility score")
+            }
         )
 
-# ----------------------------- Data -----------------------------
-else:
-    st.markdown("## Trust, coverage, and methodology")
-    cols = st.columns(3)
-    with cols[0]:
-        st.metric("On-schedule coverage", f"{system_on_time:.1f}%" if system_on_time is not None else "—")
-        st.caption("Among matched terminal predictions")
-    with cols[1]:
-        st.metric("Quality flags", f"{system_quality:.1f}%" if system_quality is not None else "—")
-        st.caption("Unmatched or ambiguous terminal predictions")
-    with cols[2]:
-        matched = int(pd.to_numeric(on_time_df.get("matched_count", pd.Series(dtype=float)), errors="coerce").sum()) if not on_time_df.empty else 0
-        st.metric("Matched trip-stops", f"{matched:,}")
-        st.caption("Counted once per trip-stop in daily metrics")
+        st.caption("🎯 Betweenness centrality is weighted most heavily in the criticality score.")
 
-    st.divider()
-    render_about_data()
+        # Network diagram for top stations
+        st.markdown("### 🔗 Critical-Station Scatter (Top 30)")
+        st.caption("Scatter view of the most central stations; use the map above for geographic context")
 
-    st.divider()
-    st.markdown("### Line-level data quality")
-    if quality_df.empty:
-        st.info("No line-level quality table is available.")
+        if st.checkbox("Show network diagram", help="Display a network graph of the top 30 most critical stations"):
+            import numpy as np
+            top_30 = critical_df.head(30)
+
+            # Create a simple network visualization using scatter plot
+            # Since we don't have network coordinates, we'll use a circular layout
+
+            # Create circular layout
+            n_stations = len(top_30)
+            angles = np.linspace(0, 2*np.pi, n_stations, endpoint=False)
+            x_coords = np.cos(angles)
+            y_coords = np.sin(angles)
+
+            # Add some randomness to avoid perfect circle
+            x_coords += np.random.normal(0, 0.1, n_stations)
+            y_coords += np.random.normal(0, 0.1, n_stations)
+
+            top_30_viz = top_30.copy()
+            top_30_viz['x'] = x_coords
+            top_30_viz['y'] = y_coords
+
+            # Create network diagram
+            fig_network = px.scatter(
+                top_30_viz,
+                x='x',
+                y='y',
+                size='combined_score',
+                color='betweenness_centrality',
+                hover_name='stop_name',
+                hover_data={
+                    'rank': True,
+                    'routes_served': True,
+                    'betweenness_centrality': ':.3f',
+                    'combined_score': ':.3f'
+                },
+                color_continuous_scale='RdYlGn_r',
+                size_max=30,
+                labels={
+                    'stop_name': 'Station',
+                    'combined_score': 'Criticality',
+                    'betweenness_centrality': 'Betweenness'
+                }
+            )
+
+            fig_network.update_layout(
+                title="Top 30 Critical Stations by Centrality",
+                xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                yaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                height=500,
+                margin=dict(l=0, r=0, t=30, b=0),
+                showlegend=False
+            )
+
+            st.plotly_chart(fig_network, use_container_width=True)
+            st.caption("This scatter ranks stations by centrality; it is not a map of physical track connections.")
+
     else:
-        qcol = route_column(quality_df)
-        qview = quality_df[[qcol, "total_predictions", "unmatched_count", "ambiguous_count", "added_service_count", "data_quality_issue_pct"]].copy()
-        qview["quality_status"] = qview["data_quality_issue_pct"].apply(
-            lambda x: "High confidence" if safe_float(x, 100) < QUALITY_WARNING_PCT else "Review"
-        )
-        qview = qview.rename(columns={qcol: "Line", "total_predictions": "Predictions", "unmatched_count": "Unmatched", "ambiguous_count": "Ambiguous", "added_service_count": "Added service", "data_quality_issue_pct": "Issue rate %", "quality_status": "Status"})
-        st.dataframe(qview, use_container_width=True, hide_index=True)
+        st.warning("No network analysis data found. Run `python -m processing.network_analysis` to generate critical stations data.")
 
     st.divider()
-    st.markdown("### Frequently asked questions")
-    for item in FAQ:
-        with st.expander(item["question"]):
-            st.write(item["answer"])
-
-    st.divider()
-    st.caption("The dashboard is intentionally explicit about its main limitation: prediction-vs-schedule metrics are not the same as observed-arrival performance.")
+    st.caption(
+        "On-time is based on the final observed realtime prediction being within 5 minutes of schedule. "
+        "Unmatched/ambiguous prediction = the realtime record did not have sufficiently strong evidence "
+        "for an active static-schedule trip; added service is classified separately."
+    )
