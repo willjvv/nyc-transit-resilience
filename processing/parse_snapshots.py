@@ -17,8 +17,9 @@ import ast
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
@@ -48,7 +49,8 @@ def _safe_mapping(value):
 
 def _raw_dates_for_service_date(service_date: str) -> list[str]:
     """Load UTC partitions spanning the requested New York service date."""
-    d = datetime.strptime(service_date, "%Y-%m-%d").date()
+    # Service dates are New York local dates, parse with NY timezone context
+    d = datetime.strptime(service_date, "%Y-%m-%d").replace(tzinfo=NY_TZ).date()
     # A service day can extend past local midnight, so include the next UTC day.
     return [d.isoformat(), (d + timedelta(days=1)).isoformat()]
 
@@ -120,11 +122,11 @@ def _prediction_rows(raw_df: pd.DataFrame) -> list[dict]:
                     "trip_start_date": start_date,
                     "predicted_arrival": int(predicted_num),
                     "predicted_arrival_utc": datetime.fromtimestamp(
-                        int(predicted_num), tz=timezone.utc
+                        int(predicted_num), tz=ZoneInfo("UTC")
                     ).isoformat(),
                     "observed_at": int(observed_at) if pd.notna(observed_at) else None,
                     "observed_at_utc": (
-                        datetime.fromtimestamp(int(observed_at), tz=timezone.utc).isoformat()
+                        datetime.fromtimestamp(int(observed_at), tz=ZoneInfo("UTC")).isoformat()
                         if pd.notna(observed_at)
                         else None
                     ),
@@ -190,7 +192,7 @@ def extract_vehicle_positions(raw_df: pd.DataFrame) -> pd.DataFrame:
                 "current_status": veh.get("current_status"),
                 "timestamp": int(timestamp) if pd.notna(timestamp) else None,
                 "timestamp_utc": (
-                    datetime.fromtimestamp(int(timestamp), tz=timezone.utc).isoformat()
+                    datetime.fromtimestamp(int(timestamp), tz=ZoneInfo("UTC")).isoformat()
                     if pd.notna(timestamp)
                     else None
                 ),

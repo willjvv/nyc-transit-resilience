@@ -7,7 +7,7 @@ converting them to America/New_York wall-clock time and candidate service dates.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -33,7 +33,7 @@ def parse_gtfs_time(value: str | int | float | None) -> int | None:
 
 def unix_to_local(timestamp: int | float) -> datetime:
     """Convert Unix timestamp to an America/New_York aware datetime."""
-    return datetime.fromtimestamp(float(timestamp), tz=timezone.utc).astimezone(NY_TZ)
+    return datetime.fromtimestamp(float(timestamp), tz=ZoneInfo("UTC")).astimezone(NY_TZ)
 
 
 def service_date_candidates(timestamp: int | float) -> list[tuple[str, int]]:
